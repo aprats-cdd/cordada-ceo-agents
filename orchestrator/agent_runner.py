@@ -5,10 +5,12 @@ Each agent runs in its own API call with isolated context.
 The agent's markdown prompt becomes the system message.
 The user's input becomes the first user message.
 
-Usage:
+Programmatic usage:
+    from orchestrator.agent_runner import run_agent
+    output = run_agent("discover", "deuda privada LatAm")
+
+CLI usage:
     python -m orchestrator.agent_runner --agent discover --input "deuda privada LatAm"
-    python -m orchestrator.agent_runner --agent compile --input-file ./notes.md
-    python -m orchestrator.agent_runner --agent audit --input-file ./draft.md --output ./audited.md
 """
 
 import argparse
@@ -27,11 +29,25 @@ from .config import (
 )
 
 
+# Shared client — created once, reused across calls
+_client: anthropic.Anthropic | None = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    """Get or create the shared Anthropic client."""
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _client
+
+
 def run_agent(
     agent_name: str,
     user_input: str,
     output_path: Path | None = None,
     interactive: bool = False,
+    save: bool = True,
+    verbose: bool = True,
 ) -> str:
     """
     Run a single agent with the given input.
@@ -41,46 +57,46 @@ def run_agent(
         user_input: The user's input text
         output_path: Optional path to save the output
         interactive: If True, enable multi-turn conversation
+        save: If True, auto-save output to disk (default: True)
+        verbose: If True, print progress banners (default: True)
 
     Returns:
         The agent's response text
     """
-    # Load agent prompt
     system_prompt = get_agent_prompt(agent_name)
     model = get_model(agent_name)
+    client = _get_client()
 
-    print(f"\n{'='*60}")
-    print(f"  AGENT: {agent_name.upper()}")
-    print(f"  MODEL: {model}")
-    print(f"  LAYER: {AGENTS[agent_name]['layer']}")
-    print(f"{'='*60}\n")
-
-    # Initialize client
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"  AGENT: {agent_name.upper()}")
+        print(f"  MODEL: {model}")
+        print(f"  LAYER: {AGENTS[agent_name]['layer']}")
+        print(f"{'='*60}\n")
 
     if interactive:
-        return _run_interactive(client, model, system_prompt, user_input, agent_name)
-
-    # Single-turn execution
-    message = client.messages.create(
-        model=model,
-        max_tokens=8096,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_input}],
-    )
-
-    response = message.content[0].text
+        response = _run_interactive(client, model, system_prompt, user_input, agent_name)
+    else:
+        message = client.messages.create(
+            model=model,
+            max_tokens=8096,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_input}],
+        )
+        response = message.content[0].text
 
     # Save output
     if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(response, encoding="utf-8")
-        print(f"\n✅ Output saved to: {output_path}")
-    else:
-        # Auto-save to outputs/
+        if verbose:
+            print(f"\n  Output saved to: {output_path}")
+    elif save:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         auto_path = OUTPUTS_DIR / f"{agent_name}_{timestamp}.md"
         auto_path.write_text(response, encoding="utf-8")
-        print(f"\n✅ Output auto-saved to: {auto_path}")
+        if verbose:
+            print(f"\n  Output saved to: {auto_path}")
 
     return response
 
@@ -99,10 +115,9 @@ def _run_interactive(
     messages = [{"role": "user", "content": initial_input}]
     full_response = ""
 
-    print("💬 Interactive mode. Type your answers. Type 'done' to finish.\n")
+    print("  Interactive mode. Type your answers. Type 'done' to finish.\n")
 
     while True:
-        # Get agent response
         message = client.messages.create(
             model=model,
             max_tokens=8096,
@@ -113,24 +128,16 @@ def _run_interactive(
         assistant_text = message.content[0].text
         full_response = assistant_text
 
-        print(f"\n🤖 {agent_name.upper()}:\n")
+        print(f"\n  {agent_name.upper()}:\n")
         print(assistant_text)
 
-        # Check if the agent seems to have finished (heuristic)
         if message.stop_reason == "end_turn":
-            # Ask if user wants to continue
-            user_reply = input("\n📝 Your response (or 'done' to finish): ").strip()
+            user_reply = input("\n  Your response (or 'done' to finish): ").strip()
             if user_reply.lower() == "done":
                 break
 
             messages.append({"role": "assistant", "content": assistant_text})
             messages.append({"role": "user", "content": user_reply})
-
-    # Save final output
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    auto_path = OUTPUTS_DIR / f"{agent_name}_{timestamp}.md"
-    auto_path.write_text(full_response, encoding="utf-8")
-    print(f"\n✅ Output saved to: {auto_path}")
 
     return full_response
 
@@ -196,9 +203,9 @@ Available agents:
     if args.list:
         print("\nAvailable agents:\n")
         for name, info in sorted(AGENTS.items(), key=lambda x: x[1]["order"]):
-            model_tag = "⭐" if name in {"audit", "reflect", "decide"} else "  "
+            model_tag = "+" if name in {"audit", "reflect", "decide"} else " "
             print(f"  {model_tag} {info['order']:02d}. {name:<18} [{info['layer']:<10}] {info['description']}")
-        print("\n⭐ = Uses premium model (Opus)")
+        print("\n+ = Uses premium model (Opus)")
         return
 
     # Resolve input
@@ -224,7 +231,7 @@ Available agents:
     )
 
     if not args.interactive:
-        print(f"\n🤖 {args.agent.upper()} response:\n")
+        print(f"\n  {args.agent.upper()} response:\n")
         print(response)
 
 
