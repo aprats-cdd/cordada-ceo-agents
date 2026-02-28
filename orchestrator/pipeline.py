@@ -53,6 +53,7 @@ def run_pipeline(
     project_description: str | None = None,
     gates: set[str] | None = None,
     on_gate: GateHandler = terminal_gate,
+    prior_outputs: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """
     Run a sequence of agents, passing outputs forward.
@@ -68,6 +69,8 @@ def run_pipeline(
         gates: Agent names where the pipeline pauses for human review.
                Default: None (no gates). Use DEFAULT_GATES for standard gates.
         on_gate: Callback function for gate handling (default: terminal_gate)
+        prior_outputs: Outputs from previous agents (used when resuming).
+                       Merged into the returned dict so callers get the full picture.
 
     Returns:
         Dict mapping agent names to their outputs
@@ -90,14 +93,12 @@ def run_pipeline(
     ]
 
     if not sequence:
-        print(f"Error: No agents between {from_agent} and {to_agent}")
-        sys.exit(1)
+        raise ValueError(f"No agents between {from_agent} and {to_agent}")
 
     # Prepare initial input
     current_input = input_text or topic
     if not current_input:
-        print("Error: Provide --topic or --input-file")
-        sys.exit(1)
+        raise ValueError("Provide topic or input_text")
 
     # Project mode: create GitHub repo for traceability
     project_dir = None
@@ -126,7 +127,7 @@ def run_pipeline(
     print(f"  Output dir: {run_dir}")
     print(f"{'#'*60}")
 
-    outputs = {}
+    outputs = dict(prior_outputs) if prior_outputs else {}
 
     for i, agent_name in enumerate(sequence):
         step = i + 1
@@ -303,7 +304,7 @@ def resume_pipeline(
 
     print(f"\n  Resuming pipeline for '{project_name}' at {paused_at.upper()}")
 
-    # Continue from the paused agent
+    # Continue from the paused agent, carrying forward prior outputs
     return run_pipeline(
         topic=topic,
         input_text=pending_input,
@@ -315,6 +316,7 @@ def resume_pipeline(
             if a in DEFAULT_GATES
         ),
         on_gate=on_gate,
+        prior_outputs=prior_outputs,
     )
 
 
