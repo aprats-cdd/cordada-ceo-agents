@@ -4,8 +4,18 @@ Pipeline Orchestrator — Chain agents into a full or partial pipeline.
 Runs agents in sequence, passing the output of each as input to the next.
 Supports starting from any stage and stopping at any stage.
 
+With --project, each run creates a GitHub repo with full git traceability:
+every agent output is committed individually, creating a complete audit trail.
+
 Usage:
+    # Standard pipeline (outputs to local files)
     python -m orchestrator.pipeline --topic "gobernanza para due diligence"
+
+    # Project mode: creates GitHub repo with full traceability
+    python -m orchestrator.pipeline --topic "gobernanza para due diligence" \
+        --project "due-diligence-fondo-xyz"
+
+    # Partial pipeline
     python -m orchestrator.pipeline --from compile --input-file ./validated.md
     python -m orchestrator.pipeline --from discover --to compile --topic "deuda privada"
 """
@@ -15,7 +25,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .config import AGENTS, OUTPUTS_DIR
+from .config import AGENTS, OUTPUTS_DIR, get_model
 from .agent_runner import run_agent
 
 
@@ -40,6 +50,8 @@ def run_pipeline(
     from_agent: str = "discover",
     to_agent: str = "reflect",
     interactive_at: set[str] | None = None,
+    project_name: str | None = None,
+    project_description: str | None = None,
 ) -> dict[str, str]:
     """
     Run a sequence of agents, passing outputs forward.
@@ -50,6 +62,8 @@ def run_pipeline(
         from_agent: Which agent to start from
         to_agent: Which agent to stop at (inclusive)
         interactive_at: Set of agent names where interactive mode is enabled
+        project_name: If provided, creates a GitHub repo for full traceability
+        project_description: Optional description for the project repo
 
     Returns:
         Dict mapping agent names to their outputs
@@ -80,7 +94,19 @@ def run_pipeline(
         print("Error: Provide --topic or --input-file")
         sys.exit(1)
 
-    # Create pipeline run directory
+    # Project mode: create GitHub repo for traceability
+    project_dir = None
+    if project_name:
+        from .project import create_project, commit_agent_output, push_project
+
+        project_dir = create_project(
+            name=project_name,
+            topic=topic or "Pipeline run",
+            description=project_description,
+            pipeline=sequence,
+        )
+
+    # Create local output directory (used in non-project mode or as backup)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = OUTPUTS_DIR / f"pipeline_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -88,14 +114,20 @@ def run_pipeline(
     print(f"\n{'#'*60}")
     print(f"  PIPELINE RUN")
     print(f"  Sequence: {' → '.join(s.upper() for s in sequence)}")
+    if project_dir:
+        print(f"  Project: {project_dir}")
     print(f"  Output dir: {run_dir}")
     print(f"{'#'*60}")
 
     outputs = {}
 
     for i, agent_name in enumerate(sequence):
+        step = i + 1
+        total = len(sequence)
+        model = get_model(agent_name)
+
         print(f"\n{'─'*60}")
-        print(f"  Step {i+1}/{len(sequence)}: {agent_name.upper()}")
+        print(f"  Step {step}/{total}: {agent_name.upper()} ({model.split('-')[1]})")
         print(f"{'─'*60}")
 
         # For agents after the first, add context about pipeline
@@ -111,7 +143,7 @@ def run_pipeline(
 
         # Run agent
         is_interactive = agent_name in interactive_at
-        output_path = run_dir / f"{i+1:02d}_{agent_name}.md"
+        output_path = run_dir / f"{step:02d}_{agent_name}.md"
 
         response = run_agent(
             agent_name=agent_name,
@@ -123,14 +155,34 @@ def run_pipeline(
         outputs[agent_name] = response
         current_input = response  # Feed to next agent
 
+        # Project mode: commit each agent output
+        if project_dir:
+            commit_agent_output(
+                project_dir=project_dir,
+                agent_name=agent_name,
+                output=response,
+                step=step,
+                total_steps=total,
+                model=model,
+                topic=topic or "Pipeline run",
+            )
+
     # Save pipeline summary
     summary_path = run_dir / "00_pipeline_summary.md"
     summary = _generate_summary(sequence, outputs, topic, timestamp)
     summary_path.write_text(summary, encoding="utf-8")
 
+    # Project mode: push all commits to GitHub
+    if project_dir:
+        push_project(project_dir)
+
     print(f"\n{'#'*60}")
     print(f"  ✅ PIPELINE COMPLETE")
     print(f"  Outputs: {run_dir}")
+    if project_dir:
+        from .project import load_manifest
+        manifest = load_manifest(project_dir)
+        print(f"  GitHub: https://github.com/{manifest['repo']}")
     print(f"  Summary: {summary_path}")
     print(f"{'#'*60}\n")
 
@@ -176,6 +228,10 @@ Examples:
   # Full pipeline from research to reflection
   python -m orchestrator.pipeline --topic "gobernanza para due diligence"
 
+  # With GitHub traceability (creates a repo per project)
+  python -m orchestrator.pipeline --topic "gobernanza para due diligence" \\
+      --project "due-diligence-fondo-xyz"
+
   # Start from COMPILE with pre-existing data
   python -m orchestrator.pipeline --from compile --input-file ./validated.md
 
@@ -220,6 +276,16 @@ Examples:
         choices=list(AGENTS.keys()),
         help="Enable interactive mode at these agents",
     )
+    parser.add_argument(
+        "--project",
+        type=str,
+        help="Project name — creates a GitHub repo with full traceability",
+    )
+    parser.add_argument(
+        "--project-description",
+        type=str,
+        help="Optional description for the project repo",
+    )
 
     args = parser.parse_args()
 
@@ -239,6 +305,8 @@ Examples:
         from_agent=args.from_agent,
         to_agent=args.to_agent,
         interactive_at=set(args.interactive_at),
+        project_name=args.project,
+        project_description=args.project_description,
     )
 
 

@@ -19,6 +19,9 @@ if not ANTHROPIC_API_KEY:
         "Get one at https://console.anthropic.com/"
     )
 
+# --- GitHub Configuration ---
+GITHUB_ORG = os.getenv("GITHUB_ORG", "cordada")
+
 # --- Model Selection ---
 # claude-sonnet-4-20250514: Best balance of quality and cost for most agents
 # claude-opus-4-6: Use for AUDIT, REFLECT, DECIDE where quality matters most
@@ -33,6 +36,8 @@ ROOT_DIR = Path(__file__).parent.parent
 AGENTS_DIR = ROOT_DIR / "agents"
 OUTPUTS_DIR = ROOT_DIR / "outputs"
 OUTPUTS_DIR.mkdir(exist_ok=True)
+PROJECTS_DIR = Path(os.getenv("PROJECTS_DIR", ROOT_DIR / "projects"))
+PROJECTS_DIR.mkdir(exist_ok=True)
 
 # --- Agent Registry ---
 # Maps agent names to their prompt files and pipeline order
