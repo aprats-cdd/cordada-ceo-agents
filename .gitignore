@@ -3,6 +3,7 @@ venv/
 __pycache__/
 *.pyc
 outputs/
+projects/
 .DS_Store
 Thumbs.db
 .vscode/

@@ -62,13 +62,13 @@ A 9-agent pipeline for CEO-level decision-making, document generation, and stake
 | Guardrails | VALIDATE | Gullí (2025) Ch. 12 |
 | Memory | Cross-session context | Gullí (2025) Ch. 9 |
 
-## Two Ways to Use
+## Three Ways to Use
 
 ### 1. Manual (Claude.ai)
 
 Copy any `agents/*.md` file into a new Claude chat as the opening message. Claude will ask for inputs, then execute. No code required.
 
-### 2. Programmatic (CLI + Claude Agent SDK)
+### 2. Programmatic (CLI)
 
 Run agents from your terminal. Each agent gets its own API call with isolated context.
 
@@ -80,8 +80,32 @@ python -m orchestrator.agent_runner --agent discover --input "deuda privada LatA
 python -m orchestrator.pipeline --topic "análisis de gobernanza para due diligence institucional"
 
 # Run from a specific stage
-python -m orchestrator.pipeline --from compile --input ./outputs/validated_data.md
+python -m orchestrator.pipeline --from compile --input-file ./outputs/validated_data.md
 ```
+
+### 3. Project Mode (GitHub Traceability)
+
+Each investigation or decision creates its own private GitHub repo. Every agent output is committed individually, creating a complete audit trail of what was observed, modeled, and decided.
+
+```bash
+# Create a project and run the full pipeline
+python -m orchestrator.pipeline \
+    --topic "análisis de gobernanza para due diligence institucional" \
+    --project "due-diligence-fondo-xyz"
+
+# Manage projects
+python -m orchestrator.project create "carta-aportantes-q1" \
+    --topic "Comunicación trimestral a aportantes"
+python -m orchestrator.project status "carta-aportantes-q1"
+python -m orchestrator.project list
+```
+
+**What you get:** A private repo at `github.com/cordada/cordada-proyecto-{name}` with:
+- Each agent output committed individually (1 commit per step)
+- Structured commit messages with agent, model, and step metadata
+- `manifest.json` tracking full run history
+- Auto-generated `README.md` with progress and audit trail
+- Full git history: `git log` shows exactly what was observed → modeled → decided
 
 ## Quick Start
 
@@ -123,13 +147,30 @@ cordada-ceo-agents/
 │   ├── __init__.py
 │   ├── config.py             ← Configuration and model selection
 │   ├── agent_runner.py       ← Run individual agents via API
-│   └── pipeline.py           ← Chain agents into full pipeline
+│   ├── pipeline.py           ← Chain agents into full pipeline
+│   └── project.py            ← GitHub repo creation + traceability
 ├── examples/                 ← Usage examples
 │   └── carta_aportantes.py
 ├── outputs/                  ← Pipeline outputs land here (gitignored)
+├── projects/                 ← Project repos cloned here (gitignored)
 ├── requirements.txt
 ├── .env.example
 └── .gitignore
+```
+
+### Project Repo Structure (created per investigation)
+
+```
+cordada-proyecto-{name}/
+├── README.md                 ← Auto-generated progress + audit trail
+├── manifest.json             ← Project metadata + full run history
+└── pipeline/                 ← Agent outputs (1 file per step)
+    ├── 01_discover.md        ← What was observed
+    ├── 02_extract.md         ← What was extracted
+    ├── 03_validate.md        ← What was verified
+    ├── 04_compile.md         ← What was drafted
+    ├── 05_audit.md           ← What experts said
+    └── 06_reflect.md         ← Strategic assessment
 ```
 
 ## References
