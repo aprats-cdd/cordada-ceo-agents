@@ -14,7 +14,9 @@ CLI usage:
 """
 
 import argparse
+import logging
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +30,15 @@ from .config import (
     get_agent_prompt,
 )
 
+logger = logging.getLogger(__name__)
+
+# Default max tokens for agent responses
+MAX_TOKENS = 16_384
+
+# Retry configuration for transient API errors
+_MAX_RETRIES = 3
+_RETRY_BACKOFF_BASE = 2  # seconds
+
 
 # Shared client — created once, reused across calls
 _client: anthropic.Anthropic | None = None
@@ -39,6 +50,49 @@ def _get_client() -> anthropic.Anthropic:
     if _client is None:
         _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     return _client
+
+
+def _call_api_with_retry(
+    client: anthropic.Anthropic,
+    *,
+    model: str,
+    max_tokens: int,
+    system: str,
+    messages: list[dict],
+) -> anthropic.types.Message:
+    """Call the Messages API with retry on transient errors."""
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+            )
+        except anthropic.APIConnectionError as e:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            wait = _RETRY_BACKOFF_BASE ** (attempt + 1)
+            logger.warning("API connection error (attempt %d/%d), retrying in %ds: %s",
+                           attempt + 1, _MAX_RETRIES, wait, e)
+            time.sleep(wait)
+        except anthropic.RateLimitError as e:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            wait = _RETRY_BACKOFF_BASE ** (attempt + 1)
+            logger.warning("Rate limited (attempt %d/%d), retrying in %ds: %s",
+                           attempt + 1, _MAX_RETRIES, wait, e)
+            time.sleep(wait)
+        except anthropic.APIStatusError as e:
+            # 5xx errors are transient; 4xx (except 429) are not
+            if e.status_code >= 500 and attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_BACKOFF_BASE ** (attempt + 1)
+                logger.warning("API server error %d (attempt %d/%d), retrying in %ds",
+                               e.status_code, attempt + 1, _MAX_RETRIES, wait)
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Unreachable: retry loop exhausted")
 
 
 def run_agent(
@@ -77,9 +131,10 @@ def run_agent(
     if interactive:
         response = _run_interactive(client, model, system_prompt, user_input, agent_name)
     else:
-        message = client.messages.create(
+        message = _call_api_with_retry(
+            client,
             model=model,
-            max_tokens=8096,
+            max_tokens=MAX_TOKENS,
             system=system_prompt,
             messages=[{"role": "user", "content": user_input}],
         )
@@ -113,20 +168,21 @@ def _run_interactive(
     The agent asks questions, you answer, it executes when ready.
     """
     messages = [{"role": "user", "content": initial_input}]
-    full_response = ""
+    all_responses: list[str] = []
 
     print("  Interactive mode. Type your answers. Type 'done' to finish.\n")
 
     while True:
-        message = client.messages.create(
+        message = _call_api_with_retry(
+            client,
             model=model,
-            max_tokens=8096,
+            max_tokens=MAX_TOKENS,
             system=system_prompt,
             messages=messages,
         )
 
         assistant_text = message.content[0].text
-        full_response = assistant_text
+        all_responses.append(assistant_text)
 
         print(f"\n  {agent_name.upper()}:\n")
         print(assistant_text)
@@ -139,7 +195,10 @@ def _run_interactive(
             messages.append({"role": "assistant", "content": assistant_text})
             messages.append({"role": "user", "content": user_reply})
 
-    return full_response
+    # Return last response (the final deliverable) plus full history as context
+    if len(all_responses) == 1:
+        return all_responses[0]
+    return all_responses[-1]
 
 
 def main():
