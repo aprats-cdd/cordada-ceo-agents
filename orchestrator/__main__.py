@@ -50,12 +50,15 @@ Examples:
         "run",
         help="Run the agent pipeline",
     )
-    run_parser.add_argument("--topic", type=str, required=True, help="Research topic")
+    run_parser.add_argument("--topic", type=str, help="Research topic")
     run_parser.add_argument("--project", type=str, help="Project name for GitHub traceability")
     run_parser.add_argument("--project-description", type=str, help="Project description")
     run_parser.add_argument("--from", dest="from_agent", default="discover", choices=list(AGENTS.keys()))
     run_parser.add_argument("--to", dest="to_agent", default="reflect", choices=list(AGENTS.keys()))
     run_parser.add_argument("--interactive-at", nargs="*", default=[], choices=list(AGENTS.keys()))
+    run_parser.add_argument("--gates", nargs="*", choices=list(AGENTS.keys()), help="Agents where pipeline pauses for CEO review")
+    run_parser.add_argument("--resume", type=str, metavar="PROJECT", help="Resume a stopped pipeline")
+    run_parser.add_argument("--gate-input", type=str, help="Human input when resuming at a gate")
 
     # --- agent ---
     agent_parser = subparsers.add_parser(
@@ -95,16 +98,29 @@ Examples:
         return
 
     if args.command == "run":
-        from .pipeline import run_pipeline
+        from .pipeline import run_pipeline, resume_pipeline
 
-        run_pipeline(
-            topic=args.topic,
-            from_agent=args.from_agent,
-            to_agent=args.to_agent,
-            interactive_at=set(args.interactive_at),
-            project_name=args.project,
-            project_description=args.project_description,
-        )
+        if args.resume:
+            resume_pipeline(
+                project_name=args.resume,
+                gate_input=args.gate_input,
+            )
+        else:
+            if not args.topic:
+                print("Error: --topic is required (or use --resume)")
+                sys.exit(1)
+
+            gate_set = set(args.gates) if args.gates else set()
+
+            run_pipeline(
+                topic=args.topic,
+                from_agent=args.from_agent,
+                to_agent=args.to_agent,
+                interactive_at=set(args.interactive_at),
+                project_name=args.project,
+                project_description=args.project_description,
+                gates=gate_set,
+            )
 
     elif args.command == "agent":
         from .agent_runner import run_agent

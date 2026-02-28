@@ -13,7 +13,7 @@ from pathlib import Path
 # Add parent to path so orchestrator is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator import agent, investigate, decide
+from orchestrator import agent, investigate, decide, DEFAULT_GATES
 
 
 def ejemplo_agente_individual():
@@ -44,9 +44,11 @@ def ejemplo_agente_individual():
     print(output[:500] + "...\n")
 
 
-def ejemplo_pipeline_local():
-    """Pipeline local sin GitHub — todo en memoria."""
-    print("\n=== Ejemplo 2: Pipeline local (DISCOVER → COMPILE) ===\n")
+def ejemplo_pipeline_con_gates():
+    """Pipeline con gates — pausa en Layer 2 para review del CEO."""
+    print("\n=== Ejemplo 2: Pipeline con gates (DISCOVER → REFLECT) ===\n")
+    print("Layer 1 (DISCOVER → COMPILE) corre automático.")
+    print("Layer 2 (AUDIT, REFLECT) pausa para tu review.\n")
 
     results = investigate(
         topic=(
@@ -56,36 +58,53 @@ def ejemplo_pipeline_local():
             "los aportantes del FIP son familias chilenas que controlan "
             "el 85% de la sociedad administradora."
         ),
-        to_agent="compile",
+        gates={"audit", "reflect"},
     )
 
-    # Acceder outputs programáticamente
-    print(f"Agents ejecutados: {list(results.keys())}")
-    print(f"DISCOVER: {len(results['discover'])} chars")
-    print(f"COMPILE: {len(results['compile'])} chars")
+    print(f"\nAgents ejecutados: {list(results.keys())}")
 
 
 def ejemplo_pipeline_con_github():
-    """Pipeline completo con repo en GitHub — trazabilidad total."""
-    print("\n=== Ejemplo 3: Pipeline con GitHub (full traceability) ===\n")
+    """Pipeline con GitHub + gates — trazabilidad total."""
+    print("\n=== Ejemplo 3: Pipeline GitHub + gates ===\n")
+    print("Crea repo en GitHub, corre Layer 1, pausa en gates.")
+    print("Si haces 'stop', guarda estado para resume después.\n")
 
     results = investigate(
         "carta-aportantes-q1-2026",
         topic=(
             "Análisis de opciones para resolver la gobernanza de Cordada. "
-            "El directorio actual no pasa filtro de due diligence institucional. "
-            "Necesito un documento que presente las opciones al grupo de aportantes."
+            "El directorio actual no pasa filtro de due diligence institucional."
         ),
-        description="Carta trimestral Q1 2026 — gobernanza y opciones para aportantes",
+        description="Carta Q1 2026 — gobernanza y opciones para aportantes",
+        gates=DEFAULT_GATES,
     )
 
-    # Todo queda en GitHub con audit trail
+    print(f"\nOutputs: {list(results.keys())}")
+
+
+def ejemplo_resume():
+    """Resume un pipeline detenido en un gate."""
+    print("\n=== Ejemplo 4: Resume pipeline ===\n")
+    print("Retoma desde donde se detuvo, con input adicional del CEO.\n")
+
+    results = investigate(
+        "carta-aportantes-q1-2026",
+        resume=True,
+        gate_input=(
+            "Proceder con panel de expertos: "
+            "abogado corporativo Ley 20.712 + "
+            "experto en persuasión Cialdini + "
+            "lógica Minto."
+        ),
+    )
+
     print(f"\nOutputs: {list(results.keys())}")
 
 
 def ejemplo_decide():
     """Usar DECIDE para presentar opciones."""
-    print("\n=== Ejemplo 4: DECIDE (opciones con trade-offs) ===\n")
+    print("\n=== Ejemplo 5: DECIDE (opciones con trade-offs) ===\n")
 
     options = decide("""
     La decisión: Resolver la gobernanza de Cordada antes del due diligence.
@@ -111,18 +130,20 @@ if __name__ == "__main__":
     print("=" * 50)
     print()
     print("1. Agente individual (COMPILE) — 1 línea")
-    print("2. Pipeline local (DISCOVER → COMPILE) — sin GitHub")
-    print("3. Pipeline con GitHub — trazabilidad total")
-    print("4. DECIDE — opciones con trade-offs")
+    print("2. Pipeline con gates — pausa en Layer 2")
+    print("3. Pipeline GitHub + gates — trazabilidad total")
+    print("4. Resume pipeline detenido")
+    print("5. DECIDE — opciones con trade-offs")
     print()
 
-    choice = input("¿Cuál quieres correr? (1/2/3/4): ").strip()
+    choice = input("¿Cuál quieres correr? (1/2/3/4/5): ").strip()
 
     examples = {
         "1": ejemplo_agente_individual,
-        "2": ejemplo_pipeline_local,
+        "2": ejemplo_pipeline_con_gates,
         "3": ejemplo_pipeline_con_github,
-        "4": ejemplo_decide,
+        "4": ejemplo_resume,
+        "5": ejemplo_decide,
     }
 
     fn = examples.get(choice)

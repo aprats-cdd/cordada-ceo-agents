@@ -228,12 +228,61 @@ def commit_agent_output(
     print(f"  📝 Committed: [{agent_name.upper()}] step {step}/{total_steps}")
 
 
+def save_pipeline_state(
+    project_dir: Path,
+    paused_at: str,
+    step: int,
+    total_steps: int,
+    pending_input: str,
+    outputs: dict[str, str],
+    note: str = "",
+) -> None:
+    """
+    Save pipeline state to manifest for later resumption.
+
+    Called when the pipeline stops at a gate. Stores enough context
+    to resume exactly where it left off.
+    """
+    now = datetime.now(timezone.utc)
+    manifest = load_manifest(project_dir)
+
+    manifest["pipeline_state"] = {
+        "paused_at": paused_at,
+        "step": step,
+        "total_steps": total_steps,
+        "pending_input": pending_input,
+        "outputs": outputs,
+        "note": note,
+        "paused_at_timestamp": now.isoformat(),
+    }
+    manifest["status"] = f"paused at {paused_at.upper()} gate"
+    manifest["updated_at"] = now.isoformat()
+
+    save_manifest(project_dir, manifest)
+
+    # Update README
+    readme = _generate_project_readme(manifest)
+    (project_dir / "README.md").write_text(readme, encoding="utf-8")
+
+    # Commit the state
+    _run_cmd(["git", "add", "."], cwd=project_dir)
+    _run_cmd(
+        ["git", "commit", "-m",
+         f"[GATE] Pipeline paused at {paused_at.upper()}\n\n"
+         f"Step: {step}/{total_steps}\n"
+         f"Note: {note or 'Awaiting CEO review'}"],
+        cwd=project_dir,
+    )
+
+    print(f"  Pipeline state saved (paused at {paused_at.upper()})")
+
+
 def push_project(project_dir: Path) -> None:
     """Push all commits to GitHub."""
-    print(f"\n☁️  Pushing to GitHub...")
+    print(f"\n  Pushing to GitHub...")
     _run_cmd_with_retry(["git", "push"], cwd=project_dir)
     manifest = load_manifest(project_dir)
-    print(f"   ✅ https://github.com/{manifest['repo']}")
+    print(f"  https://github.com/{manifest['repo']}")
 
 
 def load_manifest(project_dir: Path) -> dict:
