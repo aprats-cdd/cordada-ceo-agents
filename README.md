@@ -6,43 +6,101 @@ A 10-agent pipeline for CEO-level decision-making, document generation, and stak
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        CAPA 1 — ALIMENTACIÓN                        │
-│                                                                     │
-│   DISCOVER ──→ EXTRACT ──→ VALIDATE ──→ COMPILE                    │
-│   (research)   (parse)     (verify)     (draft)                    │
-│   🔧 web,drive  🔧 drive    🔧 web                                  │
-│      slack        slack                                             │
-└──────────────────────────────────┬──────────────────────────────────┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    CAPA 2 — INTERPRETACIÓN Y DECISIÓN               │
-│                                                                     │
-│   AUDIT ──→ REFLECT ──→ DECIDE            ⛩ Gates: CEO review      │
-│   (multi-expert)  (stress-test)  (options + trade-offs)            │
-│                                       │                             │
-│                                       ▼                             │
-│                                   CEO DECIDES                       │
-└──────────────────────────────────┬──────────────────────────────────┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    CAPA 3 — DISTRIBUCIÓN Y FEEDBACK                 │
-│                                                                     │
-│   DISTRIBUTE ──→ COLLECT + ITERATE ──→ (back to AUDIT)             │
-│   🔧 slack,gmail  🔧 slack,gmail                                    │
-│   (adapt to channel)  (parse feedback, re-inject)                  │
-└─────────────────────────────────────────────────────────────────────┘
+The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Data flows strictly downward through layers. Each layer boundary is a human checkpoint (gate).
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                        SOPORTE — CONTEXT                            │
-│                                                                     │
-│   CONTEXT  🔧 drive, gmail, slack, calendar                        │
-│   (search internal sources, suggest answers)                       │
-└─────────────────────────────────────────────────────────────────────┘
 ```
+                              user input
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  LAYER 1 — FEED                                        runs: automatic │
+│                                                        model: Sonnet   │
+│                                                                        │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐         │
+│  │ DISCOVER │───▶│ EXTRACT  │───▶│ VALIDATE │───▶│ COMPILE  │         │
+│  │          │    │          │    │          │    │          │         │
+│  │ Research │    │ Parse    │    │ Verify   │    │ Draft    │         │
+│  │ & rank   │    │ key data │    │ accuracy │    │ document │         │
+│  │ sources  │    │ from     │    │ & check  │    │ (Minto   │         │
+│  │          │    │ sources  │    │ bias     │    │ Pyramid) │         │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘         │
+│   web_search      drive_read      web_search      (no tools)          │
+│   drive_search    slack_thread                                        │
+│   slack_search                                                        │
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   │ compiled document
+                                   ▼
+                              ┌─── ⛩ ───┐
+                              │  GATE   │ CEO: proceed / modify / stop
+                              └─── ┬ ───┘
+                                   │
+┌──────────────────────────────────▼──────────────────────────────────────┐
+│  LAYER 2 — INTERPRET & DECIDE                          runs: gated     │
+│                                                        model: Opus     │
+│                                                                        │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐                         │
+│  │  AUDIT   │───▶│ REFLECT  │───▶│  DECIDE  │                         │
+│  │          │    │          │    │          │                         │
+│  │ Multi-   │    │ Strategic│    │ 2-3      │                         │
+│  │ expert   │    │ stress   │    │ options  │                         │
+│  │ panel    │    │ test     │    │ + trade- │                         │
+│  │ review   │    │          │    │ offs     │                         │
+│  └──────────┘    └──────────┘    └──────────┘                         │
+│   (no tools)      (no tools)      (no tools)                          │
+│        ▲                                                               │
+│        │ feedback loop (iteration N+1)                                 │
+└────────┼─────────────────────────┬─────────────────────────────────────┘
+         │                         │ CEO-approved decision
+         │                    ┌─── ⛩ ───┐
+         │                    │  GATE   │ CEO confirms action
+         │                    └─── ┬ ───┘
+         │                         │
+┌────────┼─────────────────────────▼─────────────────────────────────────┐
+│  LAYER 3 — DISTRIBUTE & FEEDBACK                       runs: gated    │
+│                                                        model: Sonnet  │
+│                                                                       │
+│  ┌────────────┐    ┌────────────────┐                                 │
+│  │ DISTRIBUTE │───▶│ COLLECT +      │──┐                              │
+│  │            │    │ ITERATE        │  │                              │
+│  │ Adapt to   │    │                │  │ re-inject feedback           │
+│  │ channel    │    │ Parse feedback │  │ into Layer 2                 │
+│  │ (email,    │    │ from stake-    │  │                              │
+│  │ Slack)     │    │ holders        │  │                              │
+│  └────────────┘    └────────────────┘  │                              │
+│   slack_send        slack_search       │                              │
+│   gmail_draft       gmail_search       │                              │
+│                     slack_thread       │                              │
+│                     gmail_read         │                              │
+└────────────────────────────────────────┘
+         │
+         └──────────────────────────────────── loops back to AUDIT ──────┘
+
+═══════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  SUPPORT — CONTEXT                             callable independently  │
+│                                                model: Sonnet           │
+│                                                                        │
+│  ┌──────────┐                                                          │
+│  │ CONTEXT  │  Searches internal sources to answer ad-hoc questions.   │
+│  │          │  Not part of the pipeline. Called via context() or CLI.   │
+│  └──────────┘                                                          │
+│   drive_search, gmail_search, slack_search, calendar_read              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key design properties
+
+| Property | Guarantee |
+|----------|-----------|
+| **Data flow** | Strictly sequential within a layer. Each agent receives the full output of its predecessor plus truncated context from prior agents. |
+| **Model tiering** | Layer 2 (AUDIT, REFLECT, DECIDE) uses Opus for maximum reasoning quality. All other agents use Sonnet for cost efficiency. |
+| **Gate semantics** | Gates are *blocking checkpoints*. The pipeline pauses and persists state. The CEO can resume hours or days later. Three actions: `proceed`, `modify` (inject context), `stop` (save + exit). |
+| **Tool fallback** | Every tool has a 3-tier strategy: (1) direct API if credentials exist, (2) Claude proxy if auth fails, (3) `manual_fallback` for write operations without credentials. Agents never receive an error for missing credentials. |
+| **Feedback loop** | COLLECT_ITERATE feeds back to AUDIT, not DISCOVER. This avoids re-researching; it re-evaluates the same document with new stakeholder input. |
+| **CONTEXT isolation** | CONTEXT is orthogonal to the pipeline. It has no `next` agent, no gate, and no pipeline state. It's a stateless query service. |
+| **Token budget** | Context accumulation is dynamically sized to fit within model limits. Prior outputs are proportionally truncated — the most recent agent's output is always passed in full. |
+| **Graceful shutdown** | Ctrl+C during a pipeline run saves state to manifest and commits to GitHub. The pipeline can be resumed exactly where it stopped. |
 
 ## Agents
 
@@ -227,6 +285,8 @@ cordada-ceo-agents/
 │   └── project.py            ← GitHub repo creation + traceability
 ├── outputs/                  ← Pipeline outputs (gitignored)
 ├── projects/                 ← Project repos (gitignored)
+├── tests/                   ← 63 unit tests
+├── pyproject.toml           ← Package definition with optional deps
 ├── requirements.txt
 ├── .env.example
 └── .gitignore
