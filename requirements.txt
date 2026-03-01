@@ -1,2 +1,11 @@
-anthropic>=0.42.0
+anthropic>=0.49.0
 python-dotenv>=1.0.0
+
+# Optional: Google Workspace integration (Drive, Gmail, Calendar)
+# Install with: pip install cordada-ceo-agents[google]
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+
+# Optional: Slack integration (search, read, send)
+# Install with: pip install cordada-ceo-agents[slack]
+slack-sdk>=3.27.0

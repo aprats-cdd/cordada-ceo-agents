@@ -22,6 +22,21 @@ if not ANTHROPIC_API_KEY:
 # --- GitHub Configuration ---
 GITHUB_ORG = os.getenv("GITHUB_ORG", "cordada")
 
+# --- Google Workspace Integration ---
+# Path to a Google service account JSON credentials file.
+# Required for: search_google_drive, read_google_drive_document,
+#               search_gmail, read_gmail_message, draft_gmail, read_calendar
+# Set up: https://cloud.google.com/iam/docs/service-accounts-create
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
+# If using domain-wide delegation, the email to impersonate
+GOOGLE_DELEGATE_EMAIL = os.getenv("GOOGLE_DELEGATE_EMAIL")
+
+# --- Slack Integration ---
+# Slack Bot OAuth Token (xoxb-...).
+# Required for: search_slack, read_slack_thread, send_slack_message
+# Set up: https://api.slack.com/apps → OAuth & Permissions
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+
 # --- Model Selection ---
 # claude-sonnet-4-20250514: Best balance of quality and cost for most agents
 # claude-opus-4-6: Use for AUDIT, REFLECT, DECIDE where quality matters most

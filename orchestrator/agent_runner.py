@@ -29,6 +29,7 @@ from .config import (
     get_model,
     get_agent_prompt,
 )
+from .tools import get_tools_for_agent, has_custom_tools, execute_tool
 
 logger = logging.getLogger(__name__)
 
@@ -59,16 +60,20 @@ def _call_api_with_retry(
     max_tokens: int,
     system: str,
     messages: list[dict],
+    tools: list[dict] | None = None,
 ) -> anthropic.types.Message:
     """Call the Messages API with retry on transient errors."""
     for attempt in range(_MAX_RETRIES):
         try:
-            return client.messages.create(
+            kwargs: dict = dict(
                 model=model,
                 max_tokens=max_tokens,
                 system=system,
                 messages=messages,
             )
+            if tools:
+                kwargs["tools"] = tools
+            return client.messages.create(**kwargs)
         except anthropic.APIConnectionError as e:
             if attempt == _MAX_RETRIES - 1:
                 raise
@@ -121,31 +126,38 @@ def run_agent(
     model = get_model(agent_name)
     client = _get_client()
 
+    # Get tools for this agent (may be empty)
+    tools = get_tools_for_agent(agent_name)
+
     if verbose:
         print(f"\n{'='*60}")
         print(f"  AGENT: {agent_name.upper()}")
         print(f"  MODEL: {model}")
         print(f"  LAYER: {AGENTS[agent_name]['layer']}")
+        if tools:
+            tool_names = [t.get("name", t.get("type", "?")) for t in tools]
+            print(f"  TOOLS: {', '.join(tool_names)}")
         print(f"{'='*60}\n")
 
     if interactive:
-        response = _run_interactive(client, model, system_prompt, user_input, agent_name)
+        response = _run_interactive(client, model, system_prompt, user_input, agent_name, tools)
     else:
+        messages = [{"role": "user", "content": user_input}]
+
         message = _call_api_with_retry(
             client,
             model=model,
             max_tokens=MAX_TOKENS,
             system=system_prompt,
-            messages=[{"role": "user", "content": user_input}],
+            messages=messages,
+            tools=tools or None,
         )
-        # Extract text from response, handling edge cases
-        text_blocks = [b.text for b in message.content if hasattr(b, "text")]
-        if not text_blocks:
-            raise RuntimeError(
-                f"Agent '{agent_name}' returned no text content. "
-                f"Stop reason: {message.stop_reason}"
-            )
-        response = "\n\n".join(text_blocks)
+
+        # Tool execution loop: when the model requests tool use, execute
+        # the tool and send the result back until we get a final response.
+        response = _handle_tool_loop(
+            client, model, system_prompt, messages, message, tools, agent_name, verbose
+        )
 
     # Save output
     if output_path:
@@ -163,16 +175,104 @@ def run_agent(
     return response
 
 
+def _extract_text(message: anthropic.types.Message) -> str:
+    """Extract all text content blocks from a message, joined."""
+    text_blocks = [b.text for b in message.content if hasattr(b, "text")]
+    return "\n\n".join(text_blocks) if text_blocks else ""
+
+
+def _handle_tool_loop(
+    client: anthropic.Anthropic,
+    model: str,
+    system_prompt: str,
+    messages: list[dict],
+    message: anthropic.types.Message,
+    tools: list[dict],
+    agent_name: str,
+    verbose: bool,
+    max_tool_rounds: int = 10,
+) -> str:
+    """
+    Handle the tool execution loop.
+
+    When the API returns stop_reason="tool_use", execute the requested tools
+    locally, send results back, and continue until "end_turn".
+
+    Server tools (web_search) are handled by Anthropic server-side and don't
+    enter this loop — they resolve within a single API call.
+    """
+    rounds = 0
+
+    while message.stop_reason == "tool_use" and rounds < max_tool_rounds:
+        rounds += 1
+
+        # Collect all tool_use blocks from the response
+        tool_uses = [b for b in message.content if b.type == "tool_use"]
+
+        if verbose and tool_uses:
+            names = [t.name for t in tool_uses]
+            print(f"  Tools requested: {', '.join(names)}")
+
+        # Execute each tool and collect results
+        tool_results = []
+        for tool_use in tool_uses:
+            if verbose:
+                print(f"    Executing: {tool_use.name}({tool_use.input})")
+
+            result = execute_tool(tool_use.name, tool_use.input)
+
+            if verbose:
+                preview = result[:120] + "..." if len(result) > 120 else result
+                print(f"    Result: {preview}")
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_use.id,
+                "content": result,
+            })
+
+        # Send the assistant's response (with tool_use blocks) and our
+        # tool_result messages back to the API to continue
+        messages.append({"role": "assistant", "content": message.content})
+        messages.append({"role": "user", "content": tool_results})
+
+        message = _call_api_with_retry(
+            client,
+            model=model,
+            max_tokens=MAX_TOKENS,
+            system=system_prompt,
+            messages=messages,
+            tools=tools or None,
+        )
+
+    if rounds >= max_tool_rounds:
+        logger.warning(
+            "Agent '%s' hit max tool rounds (%d). Returning partial response.",
+            agent_name, max_tool_rounds,
+        )
+
+    # Extract final text response
+    text = _extract_text(message)
+    if not text:
+        raise RuntimeError(
+            f"Agent '{agent_name}' returned no text content after {rounds} tool rounds. "
+            f"Stop reason: {message.stop_reason}"
+        )
+    return text
+
+
 def _run_interactive(
     client: anthropic.Anthropic,
     model: str,
     system_prompt: str,
     initial_input: str,
     agent_name: str,
+    tools: list[dict] | None = None,
 ) -> str:
     """
     Run an agent in interactive mode (multi-turn conversation).
     The agent asks questions, you answer, it executes when ready.
+    Tools are available during the conversation.
     """
     messages = [{"role": "user", "content": initial_input}]
     all_responses: list[str] = []
@@ -186,10 +286,18 @@ def _run_interactive(
             max_tokens=MAX_TOKENS,
             system=system_prompt,
             messages=messages,
+            tools=tools or None,
         )
 
-        text_blocks = [b.text for b in message.content if hasattr(b, "text")]
-        assistant_text = "\n\n".join(text_blocks) if text_blocks else ""
+        # Handle any tool calls before showing the response
+        if message.stop_reason == "tool_use":
+            assistant_text = _handle_tool_loop(
+                client, model, system_prompt, messages, message,
+                tools or [], agent_name, verbose=True,
+            )
+        else:
+            assistant_text = _extract_text(message)
+
         all_responses.append(assistant_text)
 
         print(f"\n  {agent_name.upper()}:\n")
@@ -205,7 +313,7 @@ def _run_interactive(
             messages.append({"role": "assistant", "content": assistant_text})
             messages.append({"role": "user", "content": user_reply})
 
-    # Return last response (the final deliverable) plus full history as context
+    # Return last response (the final deliverable)
     if len(all_responses) == 1:
         return all_responses[0]
     return all_responses[-1]
