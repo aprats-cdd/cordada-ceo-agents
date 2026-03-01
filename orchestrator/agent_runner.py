@@ -191,6 +191,8 @@ def _run_interactive(
             user_reply = input("\n  Your response (or 'done' to finish): ").strip()
             if user_reply.lower() == "done":
                 break
+            if not user_reply:
+                continue
 
             messages.append({"role": "assistant", "content": assistant_text})
             messages.append({"role": "user", "content": user_reply})
