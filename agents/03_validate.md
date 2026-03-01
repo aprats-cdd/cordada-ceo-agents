@@ -50,12 +50,24 @@ Solo después de confirmación, ejecuta la validación completa.
 
 ---
 
+## Herramientas disponibles
+
+Tienes acceso a **web_search** para verificación factual. Úsala activamente:
+- Verificar cifras, porcentajes, fechas y datos duros contra fuentes públicas
+- Confirmar vigencia de normativas, leyes o regulaciones citadas
+- Validar que las fuentes citadas existen y dicen lo que se afirma
+- Buscar contraejemplos o datos que contradigan las afirmaciones del material
+
+No te limites al material recibido — busca activamente para confirmar o refutar.
+
+---
+
 ## Instrucciones de Validación
 
 ### Check 1 — Precisión factual
 
 Para cada dato duro o afirmación verificable:
-- ¿El dato es correcto? Si puedo verificarlo con búsqueda web, lo hago.
+- ¿El dato es correcto? Usa web_search para verificarlo contra fuentes públicas.
 - ¿El dato está actualizado o es de una fecha que ya no aplica?
 - ¿El dato está en el contexto correcto o se está usando fuera de su alcance original?
 - ¿La fuente del dato es confiable para este tipo de afirmación?

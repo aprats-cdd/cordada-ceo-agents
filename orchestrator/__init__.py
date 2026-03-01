@@ -3,7 +3,7 @@ cordada-ceo-agents — Programmatic API for CEO-level agent pipeline.
 
 Usage:
 
-    from orchestrator import investigate, agent, decide
+    from orchestrator import investigate, agent, decide, context
 
     # Full pipeline with gates (pauses at Layer 2 for CEO review)
     results = investigate(
@@ -24,6 +24,9 @@ Usage:
 
     # Present decision options
     options = decide("Resolver gobernanza Cordada antes de due diligence")
+
+    # Search internal sources for context
+    answer = context("¿Cuál es el AUM actual de Cordada?")
 
     # Full pipeline without GitHub (local only)
     results = investigate(topic="análisis regulatorio CMF")
@@ -173,6 +176,27 @@ def decide(context: str, *, verbose: bool = False) -> str:
     return agent("decide", user_input=context, verbose=verbose)
 
 
+def context(question: str, *, verbose: bool = False) -> str:
+    """
+    Search internal sources (Drive, Gmail, Slack, Calendar) to answer a question.
+
+    Uses the CONTEXT agent to search across Cordada's internal sources
+    and return suggested answers with sources and confidence levels.
+
+    Args:
+        question: The question to answer (e.g., "¿Cuál es el AUM actual?")
+        verbose: Print progress (default: False)
+
+    Returns:
+        Suggested answers with sources, dates, and confidence levels.
+
+    Example:
+        answer = context("¿Quiénes son los directores actuales de Cordada?")
+        answer = context("¿Hay emails recientes sobre el due diligence?")
+    """
+    return agent("context", user_input=question, verbose=verbose)
+
+
 def list_agents() -> dict[str, dict]:
     """Return the agent registry with metadata."""
     return {
@@ -189,6 +213,7 @@ __all__ = [
     "agent",
     "investigate",
     "decide",
+    "context",
     "list_agents",
     "call_claude_as_proxy",
     "DEFAULT_GATES",

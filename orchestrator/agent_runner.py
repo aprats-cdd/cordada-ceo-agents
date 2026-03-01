@@ -339,6 +339,7 @@ Available agents:
   decide      — Present options with trade-offs
   distribute  — Adapt deliverable to channel
   collect_iterate — Parse feedback and re-inject
+  context         — Search internal sources to suggest answers
         """,
     )
 
