@@ -8,6 +8,8 @@ A 10-agent pipeline for CEO-level decision-making, document generation, and stak
 
 The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Data flows strictly downward through layers. Each layer boundary is a human checkpoint (gate).
 
+> **Interactive diagram:** open [`docs/architecture.html`](docs/architecture.html) in a browser for an animated, Material 3-styled version of the diagram below.
+
 ```
                               user input
                                   │
@@ -264,6 +266,8 @@ python -m orchestrator agent discover --input "tu tema de investigación"
 ```
 cordada-ceo-agents/
 ├── README.md
+├── docs/
+│   └── architecture.html    ← Interactive architecture diagram (Material 3)
 ├── agents/                   ← Agent prompts (usable standalone in Claude.ai)
 │   ├── 01_discover.md
 │   ├── 02_extract.md

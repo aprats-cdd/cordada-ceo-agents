@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cordada — AI Pipeline Architecture</title>
+<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Google+Sans+Display:wght@400;500;700&family=Google+Sans+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    /* Google Material 3 inspired palette */
+    --surface: #1b1b1f;
+    --surface-dim: #141418;
+    --surface-container: #1f1f23;
+    --surface-container-high: #2a2a2e;
+    --surface-container-highest: #353539;
+    --on-surface: #e6e1e6;
+    --on-surface-variant: #c9c5ca;
+    --outline: #938f94;
+    --outline-variant: #49454e;
+
+    /* Layer colors — Google-style semantic */
+    --feed-primary: #a8c7fa;
+    --feed-container: #004a77;
+    --feed-on-container: #d3e3fd;
+    --feed-dim: #1a3a5c;
+    --feed-surface: rgba(168, 199, 250, 0.05);
+    --feed-border: rgba(168, 199, 250, 0.12);
+
+    --interpret-primary: #efb8c8;
+    --interpret-container: #7d2949;
+    --interpret-on-container: #ffd8e4;
+    --interpret-dim: #5c1a38;
+    --interpret-surface: rgba(239, 184, 200, 0.05);
+    --interpret-border: rgba(239, 184, 200, 0.12);
+
+    --distribute-primary: #a8dab5;
+    --distribute-container: #006d3b;
+    --distribute-on-container: #c4eed0;
+    --distribute-dim: #1a4d2e;
+    --distribute-surface: rgba(168, 218, 181, 0.05);
+    --distribute-border: rgba(168, 218, 181, 0.12);
+
+    --support-primary: #e0c8a8;
+    --support-container: #6d4c25;
+    --support-on-container: #f0dcc4;
+    --support-dim: #4d3518;
+    --support-surface: rgba(224, 200, 168, 0.05);
+    --support-border: rgba(224, 200, 168, 0.12);
+
+    --gate-primary: #ffb74d;
+    --gate-glow: rgba(255, 183, 77, 0.15);
+
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-xl: 24px;
+    --radius-full: 9999px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--surface-dim);
+    color: var(--on-surface);
+    font-family: 'DM Sans', 'Google Sans', -apple-system, sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Subtle grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+    background-size: 48px 48px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .page {
+    position: relative;
+    z-index: 1;
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 48px 32px 80px;
+  }
+
+  /* ─── HEADER ─── */
+  .header {
+    margin-bottom: 56px;
+    animation: fadeUp 0.6s ease-out;
+  }
+
+  .header-eyebrow {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--outline);
+    margin-bottom: 12px;
+  }
+
+  .header h1 {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 36px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: var(--on-surface);
+    line-height: 1.15;
+  }
+
+  .header h1 span {
+    color: var(--outline);
+    font-weight: 400;
+  }
+
+  .header-sub {
+    margin-top: 12px;
+    font-size: 14px;
+    color: var(--on-surface-variant);
+    line-height: 1.6;
+    max-width: 640px;
+  }
+
+  /* ─── USER INPUT PILL ─── */
+  .input-pill-container {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 0;
+    animation: fadeUp 0.7s ease-out 0.1s both;
+  }
+
+  .input-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--surface-container-high);
+    border: 1px solid var(--outline-variant);
+    border-radius: var(--radius-full);
+    padding: 10px 24px 10px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--on-surface-variant);
+  }
+
+  .input-pill .icon {
+    width: 28px;
+    height: 28px;
+    background: var(--surface-container-highest);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+  }
+
+  /* ─── FLOW CONNECTOR ─── */
+  .flow-connector {
+    display: flex;
+    justify-content: center;
+    padding: 20px 0;
+    animation: fadeUp 0.7s ease-out 0.15s both;
+  }
+
+  .flow-line {
+    width: 1px;
+    height: 36px;
+    position: relative;
+  }
+
+  .flow-line::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 1px;
+    height: 100%;
+    background: linear-gradient(to bottom, transparent, var(--outline-variant));
+  }
+
+  .flow-line::after {
+    content: '';
+    position: absolute;
+    bottom: -3px;
+    left: -3px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--outline-variant);
+  }
+
+  /* ─── LAYER CARD ─── */
+  .layer-card {
+    border-radius: var(--radius-xl);
+    padding: 32px;
+    margin-bottom: 0;
+    position: relative;
+    overflow: hidden;
+    transition: transform 0.2s ease;
+  }
+
+  .layer-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: var(--radius-xl);
+    pointer-events: none;
+  }
+
+  .layer-card.feed {
+    background: var(--feed-surface);
+    border: 1px solid var(--feed-border);
+    animation: fadeUp 0.7s ease-out 0.2s both;
+  }
+  .layer-card.interpret {
+    background: var(--interpret-surface);
+    border: 1px solid var(--interpret-border);
+    animation: fadeUp 0.7s ease-out 0.4s both;
+  }
+  .layer-card.distribute {
+    background: var(--distribute-surface);
+    border: 1px solid var(--distribute-border);
+    animation: fadeUp 0.7s ease-out 0.6s both;
+  }
+  .layer-card.support {
+    background: var(--support-surface);
+    border: 1px solid var(--support-border);
+    animation: fadeUp 0.7s ease-out 0.8s both;
+  }
+
+  .layer-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 28px;
+  }
+
+  .layer-header-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .layer-number {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 1px;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .feed .layer-number { background: var(--feed-dim); color: var(--feed-primary); }
+  .interpret .layer-number { background: var(--interpret-dim); color: var(--interpret-primary); }
+  .distribute .layer-number { background: var(--distribute-dim); color: var(--distribute-primary); }
+  .support .layer-number { background: var(--support-dim); color: var(--support-primary); }
+
+  .layer-title {
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+
+  .feed .layer-title { color: var(--feed-primary); }
+  .interpret .layer-title { color: var(--interpret-primary); }
+  .distribute .layer-title { color: var(--distribute-primary); }
+  .support .layer-title { color: var(--support-primary); }
+
+  .layer-subtitle {
+    font-size: 11px;
+    color: var(--outline);
+    font-weight: 400;
+    margin-top: 1px;
+  }
+
+  .layer-badges {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .badge {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    padding: 4px 10px;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--outline-variant);
+    color: var(--on-surface-variant);
+    white-space: nowrap;
+  }
+
+  .badge.model {
+    border-color: rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.04);
+  }
+
+  /* ─── STEP CARDS ─── */
+  .steps-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .step-card {
+    flex: 1;
+    min-width: 180px;
+    background: var(--surface-container);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: var(--radius-lg);
+    padding: 20px;
+    position: relative;
+    transition: border-color 0.2s, background 0.2s;
+  }
+
+  .step-card:hover {
+    border-color: rgba(255,255,255,0.12);
+    background: var(--surface-container-high);
+  }
+
+  .step-card .step-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--on-surface);
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .step-card .step-name .step-index {
+    font-family: 'DM Mono', monospace;
+    font-size: 9px;
+    font-weight: 500;
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .feed .step-index { background: var(--feed-dim); color: var(--feed-primary); }
+  .interpret .step-index { background: var(--interpret-dim); color: var(--interpret-primary); }
+  .distribute .step-index { background: var(--distribute-dim); color: var(--distribute-primary); }
+
+  .step-card .step-desc {
+    font-size: 12px;
+    color: var(--on-surface-variant);
+    line-height: 1.55;
+    margin-bottom: 12px;
+  }
+
+  .step-card .tools-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .tool-chip {
+    font-family: 'DM Mono', monospace;
+    font-size: 9.5px;
+    letter-spacing: 0.3px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    background: rgba(255,255,255,0.04);
+    color: var(--outline);
+    border: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .no-tools {
+    font-family: 'DM Mono', monospace;
+    font-size: 9.5px;
+    color: var(--outline-variant);
+    font-style: italic;
+  }
+
+  /* Arrow connectors between steps */
+  .step-card:not(:last-child)::after {
+    content: '\2192';
+    position: absolute;
+    right: -10px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--outline-variant);
+    font-size: 14px;
+    z-index: 2;
+  }
+
+  /* ─── GATE ─── */
+  .gate-container {
+    display: flex;
+    justify-content: center;
+    padding: 24px 0;
+  }
+
+  .gate {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: rgba(255, 183, 77, 0.06);
+    border: 1px solid rgba(255, 183, 77, 0.2);
+    border-radius: var(--radius-full);
+    padding: 10px 24px 10px 14px;
+    position: relative;
+    animation: gateGlow 3s ease-in-out infinite;
+  }
+
+  .gate-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: rgba(255, 183, 77, 0.12);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+  }
+
+  .gate-text {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--gate-primary);
+  }
+
+  .gate-sub {
+    font-size: 10px;
+    color: var(--outline);
+    font-weight: 400;
+  }
+
+  /* ─── FEEDBACK LOOP INDICATOR ─── */
+  .feedback-loop {
+    display: flex;
+    justify-content: center;
+    padding: 8px 0;
+  }
+
+  .feedback-loop-pill {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    color: var(--outline);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .feedback-loop-pill .loop-arrow {
+    color: var(--interpret-primary);
+    font-size: 14px;
+  }
+
+  /* ─── DIVIDER ─── */
+  .section-divider {
+    border: none;
+    border-top: 1px dashed var(--outline-variant);
+    margin: 40px 0;
+    opacity: 0.5;
+    animation: fadeUp 0.7s ease-out 0.75s both;
+  }
+
+  /* ─── RESPONSIVE ─── */
+  @media (max-width: 768px) {
+    .page { padding: 24px 16px 60px; }
+    .header h1 { font-size: 26px; }
+    .layer-card { padding: 20px; }
+    .steps-row { flex-direction: column; }
+    .step-card:not(:last-child)::after { display: none; }
+    .layer-header { flex-direction: column; align-items: flex-start; gap: 12px; }
+  }
+
+  /* ─── ANIMATIONS ─── */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes gateGlow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,183,77,0); }
+    50% { box-shadow: 0 0 20px 0 rgba(255,183,77,0.08); }
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-eyebrow">Cordada Asset Management &middot; System Architecture</div>
+    <h1>AI Pipeline <span>&mdash; Three-Layer Architecture</span></h1>
+    <p class="header-sub">Feed &rarr; Interpret &rarr; Distribute. Cada capa tiene un gate de aprobaci&oacute;n del CEO antes de escalar. Feedback loops permiten iteraci&oacute;n entre capas.</p>
+  </header>
+
+  <!-- User Input -->
+  <div class="input-pill-container">
+    <div class="input-pill">
+      <div class="icon">&#128100;</div>
+      <span>user input</span>
+    </div>
+  </div>
+
+  <div class="flow-connector"><div class="flow-line"></div></div>
+
+  <!-- LAYER 1 — FEED -->
+  <div class="layer-card feed">
+    <div class="layer-header">
+      <div class="layer-header-left">
+        <div class="layer-number">L1</div>
+        <div>
+          <div class="layer-title">FEED</div>
+          <div class="layer-subtitle">Research, extract, validate, compile</div>
+        </div>
+      </div>
+      <div class="layer-badges">
+        <div class="badge">runs: automatic</div>
+        <div class="badge model">model: Sonnet</div>
+      </div>
+    </div>
+
+    <div class="steps-row">
+      <div class="step-card">
+        <div class="step-name"><span class="step-index">1</span>Discover</div>
+        <div class="step-desc">Research &amp; rank sources from web, Drive, and Slack</div>
+        <div class="tools-list">
+          <span class="tool-chip">web_search</span>
+          <span class="tool-chip">drive_search</span>
+          <span class="tool-chip">slack_search</span>
+        </div>
+      </div>
+      <div class="step-card">
+        <div class="step-name"><span class="step-index">2</span>Extract</div>
+        <div class="step-desc">Parse key data from discovered sources</div>
+        <div class="tools-list">
+          <span class="tool-chip">drive_read</span>
+          <span class="tool-chip">slack_thread</span>
+        </div>
+      </div>
+      <div class="step-card">
+        <div class="step-name"><span class="step-index">3</span>Validate</div>
+        <div class="step-desc">Verify accuracy &amp; check for bias</div>
+        <div class="tools-list">
+          <span class="tool-chip">web_search</span>
+        </div>
+      </div>
+      <div class="step-card">
+        <div class="step-name"><span class="step-index">4</span>Compile</div>
+        <div class="step-desc">Draft document using Minto Pyramid structure</div>
+        <span class="no-tools">no tools &mdash; reasoning only</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Gate 1 -->
+  <div class="gate-container" style="animation: fadeUp 0.7s ease-out 0.3s both;">
+    <div class="gate">
+      <div class="gate-icon">&#9961;</div>
+      <div>
+        <div class="gate-text">CEO Gate</div>
+        <div class="gate-sub">proceed &middot; modify &middot; stop</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LAYER 2 — INTERPRET & DECIDE -->
+  <div class="layer-card interpret">
+    <div class="layer-header">
+      <div class="layer-header-left">
+        <div class="layer-number">L2</div>
+        <div>
+          <div class="layer-title">INTERPRET &amp; DECIDE</div>
+          <div class="layer-subtitle">Audit, reflect, decide with trade-offs</div>
+        </div>
+      </div>
+      <div class="layer-badges">
+        <div class="badge">runs: gated</div>
+        <div class="badge model">model: Opus</div>
+      </div>
+    </div>
+
+    <div class="steps-row">
+      <div class="step-card">
+        <div class="step-name"><span class="step-index">1</span>Audit</div>
+        <div class="step-desc">Multi-expert panel review of compiled document</div>
+        <span class="no-tools">no tools &mdash; reasoning only</span>
+      </div>
+      <div class="step-card">
+        <div class="step-name"><span class="step-index">2</span>Reflect</div>
+        <div class="step-desc">Strategic stress test of assumptions</div>
+        <span class="no-tools">no tools &mdash; reasoning only</span>
+      </div>
+      <div class="step-card">
+        <div class="step-name"><span class="step-index">3</span>Decide</div>
+        <div class="step-desc">2&ndash;3 options with explicit trade-offs for CEO decision</div>
+        <span class="no-tools">no tools &mdash; reasoning only</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Gate 2 -->
+  <div class="gate-container" style="animation: fadeUp 0.7s ease-out 0.5s both;">
+    <div class="gate">
+      <div class="gate-icon">&#9961;</div>
+      <div>
+        <div class="gate-text">CEO Gate</div>
+        <div class="gate-sub">confirms action</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LAYER 3 — DISTRIBUTE & FEEDBACK -->
+  <div class="layer-card distribute">
+    <div class="layer-header">
+      <div class="layer-header-left">
+        <div class="layer-number">L3</div>
+        <div>
+          <div class="layer-title">DISTRIBUTE &amp; FEEDBACK</div>
+          <div class="layer-subtitle">Deliver to channels, collect stakeholder feedback</div>
+        </div>
+      </div>
+      <div class="layer-badges">
+        <div class="badge">runs: gated</div>
+        <div class="badge model">model: Sonnet</div>
+      </div>
+    </div>
+
+    <div class="steps-row">
+      <div class="step-card">
+        <div class="step-name"><span class="step-index">1</span>Distribute</div>
+        <div class="step-desc">Adapt and deliver to channel &mdash; email, Slack, etc.</div>
+        <div class="tools-list">
+          <span class="tool-chip">slack_send</span>
+          <span class="tool-chip">gmail_draft</span>
+        </div>
+      </div>
+      <div class="step-card">
+        <div class="step-name"><span class="step-index">2</span>Collect + Iterate</div>
+        <div class="step-desc">Parse stakeholder feedback and re-inject into Layer 2</div>
+        <div class="tools-list">
+          <span class="tool-chip">slack_search</span>
+          <span class="tool-chip">gmail_search</span>
+          <span class="tool-chip">slack_thread</span>
+          <span class="tool-chip">gmail_read</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Feedback loop -->
+  <div class="feedback-loop" style="animation: fadeUp 0.7s ease-out 0.65s both;">
+    <div class="feedback-loop-pill">
+      <span class="loop-arrow">&#8635;</span>
+      <span>feedback loop &rarr; re-injects into L2 AUDIT</span>
+    </div>
+  </div>
+
+  <!-- Divider -->
+  <hr class="section-divider">
+
+  <!-- SUPPORT — CONTEXT -->
+  <div class="layer-card support">
+    <div class="layer-header">
+      <div class="layer-header-left">
+        <div class="layer-number">S</div>
+        <div>
+          <div class="layer-title">SUPPORT &mdash; CONTEXT</div>
+          <div class="layer-subtitle">Ad-hoc queries, callable independently via context() or CLI</div>
+        </div>
+      </div>
+      <div class="layer-badges">
+        <div class="badge">callable independently</div>
+        <div class="badge model">model: Sonnet</div>
+      </div>
+    </div>
+
+    <div class="steps-row">
+      <div class="step-card" style="max-width: 360px;">
+        <div class="step-name"><span style="width:18px;height:18px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-family:'DM Mono',monospace;font-size:9px;font-weight:500;background:var(--support-dim);color:var(--support-primary);flex-shrink:0;">?</span>Context</div>
+        <div class="step-desc">Searches internal sources to answer ad-hoc questions. Not part of the main pipeline.</div>
+        <div class="tools-list">
+          <span class="tool-chip">drive_search</span>
+          <span class="tool-chip">gmail_search</span>
+          <span class="tool-chip">slack_search</span>
+          <span class="tool-chip">calendar_read</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
