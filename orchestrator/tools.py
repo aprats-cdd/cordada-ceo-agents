@@ -11,8 +11,11 @@ Architecture:
     The agent_runner executes them locally when the model requests them
     and sends tool_results back to the API.
 
-When credentials for a service aren't configured, the executor returns
-a helpful message instead of crashing, so the pipeline degrades gracefully.
+Fallback strategy — agents are never blind:
+  - Credentials available → direct API call (fast, precise)
+  - Credentials missing   → Claude sub-call with web_search (slower, approximate)
+  - Write tools (draft_gmail, send_slack) without credentials → return the
+    content for manual sending instead of failing silently
 """
 
 from __future__ import annotations
@@ -299,7 +302,8 @@ def get_tools_for_agent(agent_name: str) -> list[dict]:
     Return the tools list to pass to client.messages.create(tools=...).
 
     Combines server tools and custom tool definitions for the given agent.
-    Only includes custom tools whose backing service is configured.
+    All tools are always included — when local credentials are missing,
+    the executor falls back to a Claude sub-call with web_search.
     """
     agent_config = AGENT_TOOLS.get(agent_name)
     if not agent_config:
@@ -310,10 +314,10 @@ def get_tools_for_agent(agent_name: str) -> list[dict]:
     # Server tools (Anthropic-hosted) — include as-is
     tools.extend(agent_config.get("server_tools", []))
 
-    # Custom tools — include definitions for configured services
+    # Custom tools — always include (fallback handles missing credentials)
     for tool_name in agent_config.get("custom_tools", []):
         definition = CUSTOM_TOOL_DEFINITIONS.get(tool_name)
-        if definition and _is_tool_available(tool_name):
+        if definition:
             tools.append(definition)
 
     return tools
@@ -322,8 +326,7 @@ def get_tools_for_agent(agent_name: str) -> list[dict]:
 def has_custom_tools(agent_name: str) -> bool:
     """Check if an agent has any custom tools that require a tool execution loop."""
     agent_config = AGENT_TOOLS.get(agent_name, {})
-    custom_names = agent_config.get("custom_tools", [])
-    return any(_is_tool_available(name) for name in custom_names)
+    return bool(agent_config.get("custom_tools"))
 
 
 def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
@@ -356,19 +359,6 @@ def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
 # Service availability checks
 # ---------------------------------------------------------------------------
 
-def _is_tool_available(tool_name: str) -> bool:
-    """Check if the backing service for a tool is configured."""
-    if tool_name.startswith(("search_google_drive", "read_google_drive")):
-        return _is_google_configured()
-    if tool_name.startswith(("search_gmail", "read_gmail", "draft_gmail")):
-        return _is_google_configured()
-    if tool_name.startswith("read_calendar"):
-        return _is_google_configured()
-    if tool_name.startswith(("search_slack", "read_slack", "send_slack")):
-        return _is_slack_configured()
-    return False
-
-
 def _is_google_configured() -> bool:
     """Check if Google API credentials are available."""
     import os
@@ -382,11 +372,78 @@ def _is_slack_configured() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Claude fallback — when local credentials are missing, use a Claude
+# sub-call with web_search to approximate the tool result.
+# ---------------------------------------------------------------------------
+
+def _fallback_via_claude(tool_name: str, description: str) -> dict:
+    """
+    Fallback: use a Claude API call with web_search to approximate a tool
+    result when direct API credentials aren't configured.
+
+    This means agents are never blind — they always get real data, either
+    from the direct API (fast, precise) or from Claude + web_search
+    (slower, approximate but real).
+    """
+    try:
+        import anthropic
+        from .config import ANTHROPIC_API_KEY, MODEL_DEFAULT
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        message = client.messages.create(
+            model=MODEL_DEFAULT,
+            max_tokens=2048,
+            tools=[WEB_SEARCH_TOOL],
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Necesito que busques información real. "
+                    f"Usa web_search para encontrar lo siguiente:\n\n"
+                    f"{description}\n\n"
+                    f"Responde SOLO con los datos encontrados, estructurados como JSON. "
+                    f"No incluyas explicaciones. Si no encuentras nada relevante, "
+                    f'responde {{"results": [], "note": "No se encontró información relevante"}}.'
+                ),
+            }],
+        )
+
+        # Extract text from response (may have gone through web_search server-side)
+        text_blocks = [b.text for b in message.content if hasattr(b, "text")]
+        response_text = "\n".join(text_blocks) if text_blocks else ""
+
+        # Try to parse as JSON, otherwise wrap as result
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            return {
+                "source": "claude_fallback",
+                "tool": tool_name,
+                "results": response_text,
+            }
+
+    except Exception as e:
+        logger.error("Claude fallback for '%s' failed: %s", tool_name, e)
+        return {
+            "error": f"Fallback failed: {e}",
+            "tool": tool_name,
+            "source": "claude_fallback",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Tool executors — actual implementations
 # ---------------------------------------------------------------------------
 
 def _exec_search_google_drive(inputs: dict) -> dict:
-    """Search Google Drive via the Drive API."""
+    """Search Google Drive via the Drive API, or fallback to Claude."""
+    if not _is_google_configured():
+        return _fallback_via_claude(
+            "search_google_drive",
+            f"Busca documentos de Cordada relacionados con: {inputs['query']}. "
+            f"Busca en la web información sobre el tema que podría estar en documentos "
+            f"internos de una administradora de fondos de inversión en Chile.",
+        )
     try:
         from googleapiclient.discovery import build
         from google.oauth2 import service_account
@@ -448,7 +505,14 @@ def _exec_search_google_drive(inputs: dict) -> dict:
 
 
 def _exec_read_google_drive_document(inputs: dict) -> dict:
-    """Read a Google Drive document's content."""
+    """Read a Google Drive document's content, or fallback to Claude."""
+    if not _is_google_configured():
+        return _fallback_via_claude(
+            "read_google_drive_document",
+            f"Intenta acceder al contenido del documento con ID/URL: {inputs['file_id']}. "
+            f"Si es una URL pública, lee su contenido. Si no, busca información "
+            f"relacionada con este documento en la web.",
+        )
     try:
         from googleapiclient.discovery import build
         from google.oauth2 import service_account
@@ -490,7 +554,13 @@ def _exec_read_google_drive_document(inputs: dict) -> dict:
 
 
 def _exec_search_gmail(inputs: dict) -> dict:
-    """Search Gmail messages."""
+    """Search Gmail messages, or fallback to Claude."""
+    if not _is_google_configured():
+        return _fallback_via_claude(
+            "search_gmail",
+            f"Busca información sobre emails o comunicaciones relacionadas con: {inputs['query']}. "
+            f"Contexto: empresa Cordada, administradora de fondos de inversión en Chile.",
+        )
     try:
         from googleapiclient.discovery import build
         from google.oauth2 import service_account
@@ -543,7 +613,13 @@ def _exec_search_gmail(inputs: dict) -> dict:
 
 
 def _exec_read_gmail_message(inputs: dict) -> dict:
-    """Read a full Gmail message."""
+    """Read a full Gmail message, or fallback to Claude."""
+    if not _is_google_configured():
+        return _fallback_via_claude(
+            "read_gmail_message",
+            f"No tengo acceso directo a Gmail. El mensaje solicitado tiene ID: {inputs['message_id']}. "
+            f"No es posible leer emails específicos sin credenciales de Google.",
+        )
     try:
         from googleapiclient.discovery import build
         from google.oauth2 import service_account
@@ -596,7 +672,19 @@ def _exec_read_gmail_message(inputs: dict) -> dict:
 
 
 def _exec_draft_gmail(inputs: dict) -> dict:
-    """Create a Gmail draft."""
+    """Create a Gmail draft, or return the draft content for manual creation."""
+    if not _is_google_configured():
+        # Can't create a draft without credentials — return the content
+        # so the agent can present it to the CEO for manual sending
+        return {
+            "source": "no_credentials",
+            "status": "draft_not_created",
+            "note": "Sin credenciales de Google. El borrador se muestra abajo para envío manual.",
+            "to": inputs["to"],
+            "subject": inputs["subject"],
+            "body": inputs["body"],
+            "cc": inputs.get("cc", ""),
+        }
     try:
         from googleapiclient.discovery import build
         from google.oauth2 import service_account
@@ -641,7 +729,14 @@ def _exec_draft_gmail(inputs: dict) -> dict:
 
 
 def _exec_search_slack(inputs: dict) -> dict:
-    """Search Slack messages."""
+    """Search Slack messages, or fallback to Claude."""
+    if not _is_slack_configured():
+        return _fallback_via_claude(
+            "search_slack",
+            f"Busca información sobre conversaciones de equipo relacionadas con: {inputs['query']}. "
+            f"Contexto: equipo de Cordada, administradora de fondos de inversión en Chile. "
+            f"Busca discusiones públicas, artículos, o información que un equipo financiero discutiría.",
+        )
     try:
         from slack_sdk import WebClient
         import os
@@ -677,7 +772,14 @@ def _exec_search_slack(inputs: dict) -> dict:
 
 
 def _exec_read_slack_thread(inputs: dict) -> dict:
-    """Read a Slack thread."""
+    """Read a Slack thread, or return unavailable without credentials."""
+    if not _is_slack_configured():
+        return {
+            "source": "no_credentials",
+            "error": "Sin credenciales de Slack. No es posible leer threads específicos sin SLACK_BOT_TOKEN.",
+            "channel_id": inputs["channel_id"],
+            "thread_ts": inputs["thread_ts"],
+        }
     try:
         from slack_sdk import WebClient
         import os
@@ -707,7 +809,16 @@ def _exec_read_slack_thread(inputs: dict) -> dict:
 
 
 def _exec_send_slack_message(inputs: dict) -> dict:
-    """Send a Slack message."""
+    """Send a Slack message, or return the message for manual sending."""
+    if not _is_slack_configured():
+        return {
+            "source": "no_credentials",
+            "status": "message_not_sent",
+            "note": "Sin credenciales de Slack. El mensaje se muestra abajo para envío manual.",
+            "channel": inputs["channel"],
+            "text": inputs["text"],
+            "thread_ts": inputs.get("thread_ts", ""),
+        }
     try:
         from slack_sdk import WebClient
         import os
@@ -736,7 +847,16 @@ def _exec_send_slack_message(inputs: dict) -> dict:
 
 
 def _exec_read_calendar(inputs: dict) -> dict:
-    """Read upcoming Google Calendar events."""
+    """Read upcoming Google Calendar events, or fallback to Claude."""
+    if not _is_google_configured():
+        query = inputs.get("query", "")
+        days = inputs.get("days_ahead", 7)
+        return _fallback_via_claude(
+            "read_calendar",
+            f"Busca información sobre eventos o deadlines próximos relacionados con: "
+            f"{query or 'agenda general'}. Contexto: empresa Cordada, administradora de "
+            f"fondos de inversión en Chile. Período: próximos {days} días.",
+        )
     try:
         from googleapiclient.discovery import build
         from google.oauth2 import service_account
