@@ -297,12 +297,14 @@ def load_manifest(project_dir: Path) -> dict:
 
 
 def save_manifest(project_dir: Path, manifest: dict) -> None:
-    """Save the project manifest."""
+    """Save the project manifest atomically (write-to-temp-then-rename)."""
     manifest_path = project_dir / "manifest.json"
-    manifest_path.write_text(
+    tmp_path = manifest_path.with_suffix(".tmp")
+    tmp_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    tmp_path.rename(manifest_path)  # atomic on same filesystem
 
 
 def get_project_dir(name: str) -> Path:

@@ -19,6 +19,7 @@ CLI:
 
 import argparse
 import json
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -42,12 +43,20 @@ FULL_PIPELINE = [
     "collect_iterate",
 ]
 
+# Token budget for context accumulation.
+# Approx 4 chars per token. We leave room for the agent's system prompt
+# (~2k tokens) and response (max_tokens). 180k input budget is safe for
+# both Sonnet (200k context) and Opus (200k context).
+_MAX_CONTEXT_TOKENS = 180_000
+_CHARS_PER_TOKEN = 4  # conservative estimate
+_MAX_CONTEXT_CHARS = _MAX_CONTEXT_TOKENS * _CHARS_PER_TOKEN
+
 
 def run_pipeline(
     topic: str | None = None,
     input_text: str | None = None,
     from_agent: str = "discover",
-    to_agent: str = "reflect",
+    to_agent: str = "decide",
     interactive_at: set[str] | None = None,
     project_name: str | None = None,
     project_description: str | None = None,
@@ -129,7 +138,94 @@ def run_pipeline(
 
     outputs = dict(prior_outputs) if prior_outputs else {}
 
+    # Graceful shutdown: save state on Ctrl+C instead of losing work (Fix #12)
+    _shutdown_requested = False
+    _original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _handle_shutdown(signum, frame):
+        nonlocal _shutdown_requested
+        if _shutdown_requested:
+            # Second Ctrl+C: force exit
+            print("\n  Forced exit.")
+            sys.exit(1)
+        _shutdown_requested = True
+        print("\n  Shutdown requested. Finishing current agent, then saving state...")
+
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
+    try:
+        _run_pipeline_loop(
+            sequence, outputs, topic, current_input, gates, on_gate,
+            interactive_at, project_dir, project_name, run_dir,
+            lambda: _shutdown_requested,
+        )
+    finally:
+        signal.signal(signal.SIGINT, _original_sigint)
+
+    # Save pipeline summary
+    summary_path = run_dir / "00_pipeline_summary.md"
+    summary = _generate_summary(sequence, outputs, topic, timestamp)
+    summary_path.write_text(summary, encoding="utf-8")
+
+    # Project mode: push all commits to GitHub
+    if project_dir:
+        from .project import push_project
+
+        push_project(project_dir)
+
+    completed_agents = [a for a in sequence if a in outputs]
+    if len(completed_agents) == len(sequence):
+        print(f"\n{'#'*60}")
+        print(f"  PIPELINE COMPLETE")
+        print(f"  Outputs: {run_dir}")
+        if project_dir:
+            from .project import load_manifest
+
+            manifest = load_manifest(project_dir)
+            print(f"  GitHub: https://github.com/{manifest['repo']}")
+        print(f"  Summary: {summary_path}")
+        print(f"{'#'*60}\n")
+    else:
+        print(f"\n  Pipeline stopped after {len(completed_agents)}/{len(sequence)} agents.")
+        print(f"  Outputs saved: {run_dir}")
+
+    return outputs
+
+
+def _run_pipeline_loop(
+    sequence: list[str],
+    outputs: dict[str, str],
+    topic: str | None,
+    initial_input: str,
+    gates: set[str],
+    on_gate: GateHandler,
+    interactive_at: set[str],
+    project_dir: Path | None,
+    project_name: str | None,
+    run_dir: Path,
+    is_shutdown_requested,
+) -> None:
+    """Inner pipeline loop, extracted so the caller can wrap with signal handling."""
+    current_input = initial_input
+
     for i, agent_name in enumerate(sequence):
+        # Check for graceful shutdown before starting next agent
+        if is_shutdown_requested():
+            if project_dir:
+                from .project import save_pipeline_state, push_project
+
+                save_pipeline_state(
+                    project_dir=project_dir,
+                    paused_at=agent_name,
+                    step=i + 1,
+                    total_steps=len(sequence),
+                    pending_input="",
+                    outputs=outputs,
+                    note="Graceful shutdown (Ctrl+C)",
+                )
+                push_project(project_dir)
+            print(f"\n  Pipeline saved at {agent_name.upper()} (graceful shutdown).")
+            return
         step = i + 1
         total = len(sequence)
         model = get_model(agent_name)
@@ -138,14 +234,28 @@ def run_pipeline(
         if i > 0:
             prev_agent = sequence[i - 1]
 
-            # Build context summary from prior outputs (truncated for token budget)
+            # Dynamic token budget: allocate chars among prior summaries
+            # so the total context stays within _MAX_CONTEXT_CHARS.
+            # Reserve space for the full previous output + header.
+            prev_full_output = outputs.get(prev_agent, "")
+            header_overhead = 500  # chars for [MODO PIPELINE] header, topic, etc.
+            budget_for_summaries = max(
+                0,
+                _MAX_CONTEXT_CHARS - len(prev_full_output) - header_overhead,
+            )
+
+            # Build context summary from prior outputs (dynamically truncated)
+            prior_agents = [n for n in outputs if n != prev_agent]
+            chars_per_summary = (
+                budget_for_summaries // len(prior_agents)
+                if prior_agents else 0
+            )
+
             prior_summaries = []
-            for prev_name, prev_output in outputs.items():
-                if prev_name == prev_agent:
-                    continue  # Full output included below
-                # Include first 600 chars of each prior agent's output
-                truncated = prev_output[:600]
-                if len(prev_output) > 600:
+            for prev_name in prior_agents:
+                prev_output = outputs[prev_name]
+                truncated = prev_output[:chars_per_summary]
+                if len(prev_output) > chars_per_summary:
                     truncated += "\n[... truncado]"
                 prior_summaries.append(f"### {prev_name.upper()}\n{truncated}")
 
@@ -220,7 +330,7 @@ def run_pipeline(
                 if project_name:
                     print(f"  Resume: investigate(\"{project_name}\", resume=True)")
                 print(f"  State saved: {state_path}")
-                return outputs
+                return
 
             elif gate_result.action == "modify" and gate_result.modified_input:
                 pipeline_context = gate_result.modified_input
@@ -260,30 +370,6 @@ def run_pipeline(
                 model=model,
                 topic=topic or "Pipeline run",
             )
-
-    # Save pipeline summary
-    summary_path = run_dir / "00_pipeline_summary.md"
-    summary = _generate_summary(sequence, outputs, topic, timestamp)
-    summary_path.write_text(summary, encoding="utf-8")
-
-    # Project mode: push all commits to GitHub
-    if project_dir:
-        from .project import push_project
-
-        push_project(project_dir)
-
-    print(f"\n{'#'*60}")
-    print(f"  PIPELINE COMPLETE")
-    print(f"  Outputs: {run_dir}")
-    if project_dir:
-        from .project import load_manifest
-
-        manifest = load_manifest(project_dir)
-        print(f"  GitHub: https://github.com/{manifest['repo']}")
-    print(f"  Summary: {summary_path}")
-    print(f"{'#'*60}\n")
-
-    return outputs
 
 
 def resume_pipeline(
