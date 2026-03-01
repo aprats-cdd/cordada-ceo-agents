@@ -105,6 +105,13 @@ AGENTS = {
         "description": "Parse feedback and re-inject",
         "next": "audit",  # Loop back
     },
+    "context": {
+        "file": "10_context.md",
+        "order": 10,
+        "layer": "support",
+        "description": "Search internal sources to suggest answers",
+        "next": None,
+    },
 }
 
 
