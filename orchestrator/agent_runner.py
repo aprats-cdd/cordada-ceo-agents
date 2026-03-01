@@ -28,6 +28,8 @@ from .config import (
     ANTHROPIC_API_KEY,
     AGENTS,
     OUTPUTS_DIR,
+    CONTEXT_ENABLED,
+    CONTEXT_SOURCES,
     get_model,
     get_agent_prompt,
 )
@@ -144,6 +146,7 @@ def run_agent(
     interactive: bool = False,
     save: bool = True,
     verbose: bool = True,
+    context_enabled: bool = False,
 ) -> str:
     """
     Run a single agent with the given input.
@@ -155,6 +158,7 @@ def run_agent(
         interactive: If True, enable multi-turn conversation
         save: If True, auto-save output to disk (default: True)
         verbose: If True, print progress banners (default: True)
+        context_enabled: If True, activate CONTEXT middleware in interactive mode
 
     Returns:
         The agent's response text
@@ -181,7 +185,10 @@ def run_agent(
         print(f"{'='*60}\n")
 
     if interactive:
-        response = _run_interactive(client, model, system_prompt, user_input, agent_name, tools)
+        response = _run_interactive(
+            client, model, system_prompt, user_input, agent_name, tools,
+            context_enabled=context_enabled,
+        )
     else:
         messages = [{"role": "user", "content": user_input}]
 
@@ -332,14 +339,31 @@ def _run_interactive(
     initial_input: str,
     agent_name: str,
     tools: list[dict] | None = None,
+    context_enabled: bool = False,
 ) -> str:
     """
     Run an agent in interactive mode (multi-turn conversation).
     The agent asks questions, you answer, it executes when ready.
     Tools are available during the conversation.
+
+    When *context_enabled* is True the CONTEXT middleware intercepts
+    each agent question, searches Drive/Gmail/Slack, and offers
+    suggested answers before prompting for manual input.
     """
     messages = [{"role": "user", "content": initial_input}]
     all_responses: list[str] = []
+
+    # --- CONTEXT middleware setup ---
+    ctx_available = False
+    ctx_sources: set[str] = set()
+    if context_enabled and CONTEXT_ENABLED:
+        from .context_middleware import check_availability
+        ctx_available, warning = check_availability(CONTEXT_SOURCES)
+        ctx_sources = CONTEXT_SOURCES
+        if warning:
+            print(f"\n  {warning}\n")
+    elif context_enabled and not CONTEXT_ENABLED:
+        print("\n  CONTEXT middleware deshabilitado via CONTEXT_ENABLED=false en .env\n")
 
     print("  Interactive mode. Type your answers. Type 'done' to finish.\n")
 
@@ -368,8 +392,12 @@ def _run_interactive(
         print(assistant_text)
 
         if message.stop_reason == "end_turn":
-            user_reply = input("\n  Your response (or 'done' to finish): ").strip()
-            if user_reply.lower() == "done":
+            user_reply = _prompt_with_context(
+                assistant_text,
+                ctx_available=ctx_available,
+                ctx_sources=ctx_sources,
+            )
+            if user_reply is None:  # user typed 'done'
                 break
             if not user_reply:
                 continue
@@ -381,6 +409,43 @@ def _run_interactive(
     if len(all_responses) == 1:
         return all_responses[0]
     return all_responses[-1]
+
+
+def _prompt_with_context(
+    assistant_text: str,
+    *,
+    ctx_available: bool,
+    ctx_sources: set[str],
+) -> str | None:
+    """Prompt the user, optionally showing CONTEXT suggestions first.
+
+    Returns:
+        The user's reply string, or ``None`` when the user types 'done'.
+        An empty string means "skip" (no input).
+    """
+    if ctx_available:
+        from .context_middleware import (
+            suggest_answers,
+            format_suggestions,
+            compile_confirmed_answers,
+        )
+
+        result = suggest_answers(assistant_text, sources=ctx_sources)
+        if result:
+            print(format_suggestions(result))
+            choice = input("\n  Tu eleccion (1/2/3): ").strip()
+            if choice == "1":
+                reply = compile_confirmed_answers(result)
+                print(f"\n  -> Pasando respuestas confirmadas al agente...\n")
+                return reply
+            elif choice == "2":
+                return input("  Correccion: ").strip()
+            # choice == "3" or anything else → fall through to manual input
+
+    user_reply = input("\n  Your response (or 'done' to finish): ").strip()
+    if user_reply.lower() == "done":
+        return None
+    return user_reply
 
 
 def main():
@@ -435,6 +500,11 @@ Available agents:
         help="Run in interactive mode (multi-turn conversation)",
     )
     parser.add_argument(
+        "--context",
+        action="store_true",
+        help="Enable CONTEXT middleware (searches Drive/Gmail/Slack for suggested answers)",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List all available agents",
@@ -470,6 +540,7 @@ Available agents:
         user_input=user_input,
         output_path=output_path,
         interactive=args.interactive,
+        context_enabled=args.context,
     )
 
     if not args.interactive:

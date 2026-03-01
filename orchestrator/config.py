@@ -37,6 +37,18 @@ GOOGLE_DELEGATE_EMAIL = os.getenv("GOOGLE_DELEGATE_EMAIL")
 # Set up: https://api.slack.com/apps → OAuth & Permissions
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
+# --- CONTEXT Middleware ---
+# When True (and --context flag is passed), the CONTEXT middleware
+# intercepts agent questions in interactive mode and searches internal
+# sources for suggested answers.
+CONTEXT_ENABLED = os.getenv("CONTEXT_ENABLED", "true").lower() in ("true", "1", "yes")
+# Comma-separated list of sources to search: drive, gmail, slack
+CONTEXT_SOURCES: set[str] = {
+    s.strip()
+    for s in os.getenv("CONTEXT_SOURCES", "drive,gmail,slack").split(",")
+    if s.strip()
+}
+
 # --- Model Selection ---
 # claude-sonnet-4-20250514: Best balance of quality and cost for most agents
 # claude-opus-4-6: Use for AUDIT, REFLECT, DECIDE where quality matters most
