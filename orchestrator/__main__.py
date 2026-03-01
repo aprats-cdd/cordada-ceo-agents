@@ -54,7 +54,7 @@ Examples:
     run_parser.add_argument("--project", type=str, help="Project name for GitHub traceability")
     run_parser.add_argument("--project-description", type=str, help="Project description")
     run_parser.add_argument("--from", dest="from_agent", default="discover", choices=list(AGENTS.keys()))
-    run_parser.add_argument("--to", dest="to_agent", default="reflect", choices=list(AGENTS.keys()))
+    run_parser.add_argument("--to", dest="to_agent", default="decide", choices=list(AGENTS.keys()))
     run_parser.add_argument("--interactive-at", nargs="*", default=[], choices=list(AGENTS.keys()))
     run_parser.add_argument("--gates", nargs="*", choices=list(AGENTS.keys()), help="Agents where pipeline pauses for CEO review")
     run_parser.add_argument("--resume", type=str, metavar="PROJECT", help="Resume a stopped pipeline")
@@ -150,11 +150,53 @@ Examples:
             print(response)
 
     elif args.command == "project":
-        from .project import main as project_main
+        from .project import (
+            create_project, get_project_dir, load_manifest, list_projects,
+        )
 
-        # Re-parse with project subcommand argv
-        sys.argv = ["orchestrator.project"] + sys.argv[2:]
-        project_main()
+        if not args.project_command:
+            project_parser.print_help()
+            return
+
+        if args.project_command == "create":
+            create_project(
+                name=args.name,
+                topic=args.topic,
+                description=getattr(args, "description", None),
+            )
+        elif args.project_command == "status":
+            try:
+                project_dir = get_project_dir(args.name)
+                manifest = load_manifest(project_dir)
+            except FileNotFoundError as e:
+                print(f"Error: {e}")
+                sys.exit(1)
+
+            print(f"\n  Project: {manifest['project']}")
+            print(f"  Topic: {manifest['topic']}")
+            print(f"  Status: {manifest['status']}")
+            pipeline_str = " -> ".join(p.upper() for p in manifest["pipeline"])
+            print(f"  Pipeline: {pipeline_str}")
+            completed = ", ".join(a.upper() for a in manifest["agents_completed"])
+            print(f"  Completed: {completed or 'none'}")
+            print(f"  Runs: {len(manifest['runs'])}")
+            print(f"  Repo: https://github.com/{manifest['repo']}")
+        elif args.project_command == "list":
+            projects = list_projects()
+            if not projects:
+                print("\nNo projects found.")
+                return
+            print(f"\n{'Project':<35} {'Status':<20} {'Agents':<10} {'Created':<12}")
+            print("-" * 80)
+            for p in projects:
+                n_done = len(p["agents_completed"])
+                n_total = len(p["pipeline"])
+                print(
+                    f"{p['project']:<35} "
+                    f"{p['status']:<20} "
+                    f"{n_done}/{n_total:<7} "
+                    f"{p['created_at'][:10]}"
+                )
 
     elif args.command == "list":
         from .config import PREMIUM_AGENTS

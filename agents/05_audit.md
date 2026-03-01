@@ -2,6 +2,13 @@
 
 ---
 
+## Modos de Ejecución
+
+- **Modo interactivo (Claude.ai / terminal -i):** Sigue el Paso 0 completo. Pregunta y espera respuestas.
+- **Modo pipeline (API):** Si recibes input con el marcador `[MODO PIPELINE]`, salta el Paso 0 y ejecuta directamente. Toma el documento de COMPILE como documento a auditar, propón un panel de 3 expertos basándote en el tema (usa la tabla de referencia), infiere el contexto del pipeline acumulado, y ejecuta la auditoría completa (Pasos 1-5).
+
+---
+
 ## Instrucciones de Comportamiento
 
 Cuando el usuario cargue este prompt en un nuevo chat, NO ejecutes nada todavía. Primero recopila los inputs necesarios siguiendo esta secuencia:

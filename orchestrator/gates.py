@@ -154,5 +154,8 @@ def auto_gate(ctx: GateContext) -> GateResult:
     return GateResult(action="proceed")
 
 
-# Default gates: Layer 2 agents
-DEFAULT_GATES = {"audit", "reflect", "decide"}
+# Default gates: agents that require CEO review before running.
+# - audit/reflect/decide: Layer 2 — strategic evaluation requires context
+# - distribute: CEO must confirm channel/recipients before sending
+# - collect_iterate: requires real-world feedback (temporal gap after distribute)
+DEFAULT_GATES = {"audit", "reflect", "decide", "distribute", "collect_iterate"}

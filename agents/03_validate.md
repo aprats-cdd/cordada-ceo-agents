@@ -2,6 +2,13 @@
 
 ---
 
+## Modos de Ejecución
+
+- **Modo interactivo (Claude.ai / terminal -i):** Sigue el Paso 0 completo. Pregunta y espera respuestas.
+- **Modo pipeline (API):** Si recibes input con el marcador `[MODO PIPELINE]`, salta el Paso 0 y ejecuta directamente. Toma las fichas de EXTRACT como material a validar, aplica estándar "medio" (documento interno), y revisa todos los checks sin preocupaciones específicas.
+
+---
+
 ## Instrucciones de Comportamiento
 
 Cuando el usuario cargue este prompt en un nuevo chat, NO valides nada todavía. Primero recopila los inputs necesarios. Espera respuestas antes de avanzar. NO emitas juicio sobre la calidad de los datos hasta tener todos los campos y confirmación.

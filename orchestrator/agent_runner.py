@@ -138,7 +138,14 @@ def run_agent(
             system=system_prompt,
             messages=[{"role": "user", "content": user_input}],
         )
-        response = message.content[0].text
+        # Extract text from response, handling edge cases
+        text_blocks = [b.text for b in message.content if hasattr(b, "text")]
+        if not text_blocks:
+            raise RuntimeError(
+                f"Agent '{agent_name}' returned no text content. "
+                f"Stop reason: {message.stop_reason}"
+            )
+        response = "\n\n".join(text_blocks)
 
     # Save output
     if output_path:
@@ -181,7 +188,8 @@ def _run_interactive(
             messages=messages,
         )
 
-        assistant_text = message.content[0].text
+        text_blocks = [b.text for b in message.content if hasattr(b, "text")]
+        assistant_text = "\n\n".join(text_blocks) if text_blocks else ""
         all_responses.append(assistant_text)
 
         print(f"\n  {agent_name.upper()}:\n")

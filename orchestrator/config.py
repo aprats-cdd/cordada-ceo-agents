@@ -82,14 +82,14 @@ AGENTS = {
         "order": 6,
         "layer": "decide",
         "description": "Strategic stress-test",
-        "next": "distribute",
+        "next": "decide",
     },
     "decide": {
         "file": "07_decide.md",
         "order": 7,
         "layer": "decide",
         "description": "Present options with trade-offs",
-        "next": None,  # CEO decides, then manually triggers next
+        "next": "distribute",
     },
     "distribute": {
         "file": "08_distribute.md",

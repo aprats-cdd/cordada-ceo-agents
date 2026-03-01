@@ -2,6 +2,13 @@
 
 ---
 
+## Modos de Ejecución
+
+- **Modo interactivo (Claude.ai / terminal -i):** Sigue el Paso 0 completo. Pregunta y espera respuestas.
+- **Modo pipeline (API):** Si recibes input con el marcador `[MODO PIPELINE]`, salta el Paso 0 y ejecuta directamente. Toma el feedback provisto y el documento distribuido del contexto acumulado. Ejecuta análisis completo (interpretar + ajustar + siguiente movimiento).
+
+---
+
 ## Instrucciones de Comportamiento
 
 Cuando el usuario cargue este prompt en un nuevo chat, NO proceses nada todavía. Primero recopila los inputs necesarios. Espera respuestas antes de avanzar.

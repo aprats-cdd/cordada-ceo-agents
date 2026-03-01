@@ -126,8 +126,8 @@ def create_project(
     # Create pipeline directory
     (project_dir / "pipeline").mkdir(exist_ok=True)
 
-    # Initial commit
-    _run_cmd(["git", "add", "."], cwd=project_dir)
+    # Initial commit — add specific files only
+    _run_cmd(["git", "add", "manifest.json", "README.md", "pipeline/"], cwd=project_dir)
     _run_cmd(
         ["git", "commit", "-m", f"[INIT] Proyecto: {name}\n\nTopic: {topic}\nPipeline: {' → '.join(p.upper() for p in pipeline)}"],
         cwd=project_dir,
@@ -211,8 +211,13 @@ def commit_agent_output(
     readme = _generate_project_readme(manifest)
     (project_dir / "README.md").write_text(readme, encoding="utf-8")
 
-    # Git commit
-    _run_cmd(["git", "add", "."], cwd=project_dir)
+    # Git commit — add specific files
+    files_to_add = [
+        str(output_path.relative_to(project_dir)),
+        "manifest.json",
+        "README.md",
+    ]
+    _run_cmd(["git", "add"] + files_to_add, cwd=project_dir)
 
     commit_msg = (
         f"[{agent_name.upper()}] Step {step}/{total_steps} — {agent_info['description']}\n"
@@ -264,8 +269,8 @@ def save_pipeline_state(
     readme = _generate_project_readme(manifest)
     (project_dir / "README.md").write_text(readme, encoding="utf-8")
 
-    # Commit the state
-    _run_cmd(["git", "add", "."], cwd=project_dir)
+    # Commit the state — add specific files
+    _run_cmd(["git", "add", "manifest.json", "README.md"], cwd=project_dir)
     _run_cmd(
         ["git", "commit", "-m",
          f"[GATE] Pipeline paused at {paused_at.upper()}\n\n"

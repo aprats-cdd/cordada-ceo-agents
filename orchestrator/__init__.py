@@ -35,14 +35,14 @@ from .gates import DEFAULT_GATES, GateHandler, terminal_gate, auto_gate
 from .config import AGENTS
 
 
-def agent(name: str, input: str, *, verbose: bool = False) -> str:
+def agent(name: str, user_input: str, *, verbose: bool = False) -> str:
     """
     Run a single agent and return its output.
 
     Args:
         name: Agent name (discover, extract, validate, compile,
-              audit, reflect, decide, distribute, collect_iterate)
-        input: The text input for the agent
+              audit, reflect, decide, distribute, collect_iterate, context)
+        user_input: The text input for the agent
         verbose: Print progress banners (default: False)
 
     Returns:
@@ -54,7 +54,7 @@ def agent(name: str, input: str, *, verbose: bool = False) -> str:
     """
     return _run_agent(
         agent_name=name,
-        user_input=input,
+        user_input=user_input,
         save=False,
         verbose=verbose,
     )
@@ -66,7 +66,7 @@ def investigate(
     topic: str | None = None,
     description: str | None = None,
     from_agent: str = "discover",
-    to_agent: str = "reflect",
+    to_agent: str = "decide",
     gates: set[str] | None = None,
     on_gate: GateHandler = terminal_gate,
     resume: bool = False,
@@ -79,6 +79,7 @@ def investigate(
 
     Layer 1 (DISCOVER → COMPILE) runs automatically.
     Layer 2 (AUDIT, REFLECT, DECIDE) pauses at gates for CEO review.
+    Layer 3 (DISTRIBUTE, COLLECT_ITERATE) requires mandatory gates.
 
     Args:
         project: Project slug for GitHub traceability (optional).
@@ -86,9 +87,9 @@ def investigate(
         topic: Research topic or decision context
         description: Optional longer description for the project
         from_agent: Start from this agent (default: discover)
-        to_agent: Stop at this agent (default: reflect)
+        to_agent: Stop at this agent (default: decide)
         gates: Agents where pipeline pauses for CEO review.
-               Use DEFAULT_GATES for standard gates (audit, reflect, decide).
+               Use DEFAULT_GATES for standard gates.
         on_gate: Gate handler callback (default: terminal_gate).
                  Use auto_gate for fully automated runs.
         resume: If True, resume a previously stopped pipeline
@@ -168,7 +169,7 @@ def decide(context: str, *, verbose: bool = False) -> str:
             "Opciones: reorganizar directorio, vender participación, o negociar waiver."
         )
     """
-    return agent("decide", context, verbose=verbose)
+    return agent("decide", user_input=context, verbose=verbose)
 
 
 def list_agents() -> dict[str, dict]:
