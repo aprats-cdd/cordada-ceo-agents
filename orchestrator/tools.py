@@ -12,12 +12,12 @@ Architecture:
     and sends tool_results back to the API.
 
 Fallback strategy — agents are NEVER blind:
-  - Credentials available → direct API call (fast, precise)
-  - Credentials missing OR auth error → call_claude_as_proxy() sends a
+  - Credentials available -> direct API call (fast, precise)
+  - Credentials missing OR auth error -> call_claude_as_proxy() sends a
     structured prompt to Claude (claude-sonnet-4-20250514), which uses
     its MCP-connected tools (Gmail, Drive, Slack) to retrieve the data
-  - Write tools (draft_gmail, send_slack) without credentials → return the
-    content for manual sending instead of failing silently
+  - Write tools (draft_gmail, send_slack) without credentials -> return the
+    content for manual sending (NEVER proxied — security boundary)
   - The calling agent never knows whether data came from direct API or proxy
 """
 
@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
+from functools import lru_cache
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,9 @@ _PROXY_SYSTEM_PROMPT = (
     "Execute the requested operation using your available tools (Gmail, Slack, Google Drive). "
     "Return ONLY a JSON object with the results. No explanations."
 )
+
+# Timeout for tool execution (seconds)
+_TOOL_TIMEOUT_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +355,8 @@ def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     Each handler tries the direct API first, then falls back to
     call_claude_as_proxy() if credentials are missing or auth fails.
     Returns a JSON string with the result or an error message.
+
+    Enforces a timeout of _TOOL_TIMEOUT_SECONDS to prevent hangs.
     """
     executor = _TOOL_EXECUTORS.get(tool_name)
     if not executor:
@@ -358,8 +366,14 @@ def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         })
 
     try:
-        result = executor(tool_input)
+        result = _run_with_timeout(executor, tool_input, timeout=_TOOL_TIMEOUT_SECONDS)
         return json.dumps(result, ensure_ascii=False) if isinstance(result, (dict, list)) else str(result)
+    except TimeoutError:
+        logger.error("Tool '%s' timed out after %ds", tool_name, _TOOL_TIMEOUT_SECONDS)
+        return json.dumps({
+            "error": f"Tool execution timed out after {_TOOL_TIMEOUT_SECONDS}s",
+            "tool": tool_name,
+        })
     except Exception as e:
         logger.error("Tool '%s' failed: %s", tool_name, e)
         return json.dumps({
@@ -370,29 +384,81 @@ def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Service availability checks
+# Timeout wrapper (Fix #8)
 # ---------------------------------------------------------------------------
 
+def _run_with_timeout(func, inputs: dict, timeout: int) -> dict:
+    """Run a tool executor with a timeout. Raises TimeoutError if exceeded."""
+    result_holder: list = []
+    error_holder: list = []
+
+    def target():
+        try:
+            result_holder.append(func(inputs))
+        except Exception as e:
+            error_holder.append(e)
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        raise TimeoutError(f"Tool execution exceeded {timeout}s")
+    if error_holder:
+        raise error_holder[0]
+    if result_holder:
+        return result_holder[0]
+    raise RuntimeError("Tool returned no result")
+
+
+# ---------------------------------------------------------------------------
+# Service availability checks (cached at first call)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
 def _is_google_configured() -> bool:
     """Check if Google API credentials are available."""
-    import os
     return bool(os.getenv("GOOGLE_CREDENTIALS_PATH"))
 
 
+@lru_cache(maxsize=1)
 def _is_slack_configured() -> bool:
     """Check if Slack API credentials are available."""
-    import os
     return bool(os.getenv("SLACK_BOT_TOKEN"))
 
 
 def _is_auth_error(exc: Exception) -> bool:
-    """Check if an exception is an authentication/authorization error."""
+    """
+    Check if an exception is an authentication/authorization error.
+
+    Uses a multi-strategy approach:
+      1. Check known exception types from Google/Slack SDKs
+      2. Check HTTP status codes on response objects
+      3. Fall back to string matching for unknown exception types
+    """
+    # Strategy 1: Check known exception types
+    exc_type_name = type(exc).__name__
+    auth_exception_types = {
+        "RefreshError",          # google.auth.exceptions.RefreshError
+        "TransportError",        # google.auth.transport — often auth
+        "SlackApiError",         # May carry auth-related response
+    }
+
+    # Strategy 2: Check HTTP status codes if available
+    status_code = None
+    if hasattr(exc, "resp") and hasattr(exc.resp, "status"):
+        status_code = exc.resp.status  # Google API errors
+    elif hasattr(exc, "response") and hasattr(exc.response, "status_code"):
+        status_code = exc.response.status_code  # Slack SDK errors
+
+    if status_code in (401, 403):
+        return True
+
+    # Strategy 3: String matching as fallback
     error_str = str(exc).lower()
     auth_indicators = [
         "invalid credentials",
         "unauthorized",
-        "403",
-        "401",
         "access denied",
         "permission denied",
         "invalid_auth",
@@ -405,9 +471,90 @@ def _is_auth_error(exc: Exception) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Google service factory (Fix #2 — DRY: one place for credential loading)
+# ---------------------------------------------------------------------------
+
+_google_service_cache: dict[str, Any] = {}
+
+
+def _get_google_service(api: str, version: str, scopes: list[str]) -> Any:
+    """
+    Build and cache a Google API service client.
+
+    Args:
+        api: API name (e.g., "drive", "gmail", "calendar")
+        version: API version (e.g., "v3", "v1")
+        scopes: OAuth scopes needed
+
+    Returns:
+        Google API service resource object
+
+    Raises:
+        ImportError: If google-api-python-client is not installed
+        RuntimeError: If credentials are not configured
+    """
+    cache_key = f"{api}:{version}:{','.join(sorted(scopes))}"
+    if cache_key in _google_service_cache:
+        return _google_service_cache[cache_key]
+
+    from googleapiclient.discovery import build
+    from google.oauth2 import service_account
+
+    creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
+    if not creds_path:
+        raise RuntimeError("GOOGLE_CREDENTIALS_PATH not set")
+
+    creds = service_account.Credentials.from_service_account_file(
+        creds_path, scopes=scopes,
+    )
+    delegate_email = os.getenv("GOOGLE_DELEGATE_EMAIL")
+    if delegate_email:
+        creds = creds.with_subject(delegate_email)
+
+    service = build(api, version, credentials=creds)
+    _google_service_cache[cache_key] = service
+    return service
+
+
+def _get_slack_client() -> Any:
+    """Build a Slack WebClient. Raises ImportError if slack-sdk not installed."""
+    from slack_sdk import WebClient
+    return WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+
+
+# ---------------------------------------------------------------------------
+# Proxy instruction builder (DRY for JSON schema instructions)
+# ---------------------------------------------------------------------------
+
+def _proxy_instruction(action: str, params: str, schema: str) -> str:
+    """Build a structured proxy instruction with consistent format."""
+    return (
+        f"{action}. {params}"
+        f"Return results as JSON with this exact structure: {schema}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Claude proxy — when local credentials are missing or auth fails, call
 # Claude (which has MCP-connected Gmail, Drive, Slack) to retrieve data.
 # ---------------------------------------------------------------------------
+
+# Shared Anthropic client for proxy calls (Fix #5 — reuse TCP connection)
+_proxy_client: Any = None
+_proxy_client_lock = threading.Lock()
+
+
+def _get_proxy_client() -> Any:
+    """Get or create the shared Anthropic client for proxy calls."""
+    global _proxy_client
+    if _proxy_client is None:
+        with _proxy_client_lock:
+            if _proxy_client is None:  # double-check locking
+                import anthropic
+                from .config import ANTHROPIC_API_KEY
+                _proxy_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _proxy_client
+
 
 def call_claude_as_proxy(tool_instruction: str) -> dict:
     """
@@ -423,18 +570,13 @@ def call_claude_as_proxy(tool_instruction: str) -> dict:
     Args:
         tool_instruction: Natural language instruction describing exactly
             what data to retrieve and in what format to return it.
-            E.g., "Search Gmail for emails from X with subject Y,
-            return results as JSON with fields: id, subject, from, date, snippet"
 
     Returns:
         Parsed JSON dict from Claude's response, or an error dict if the
         proxy call fails.
     """
     try:
-        import anthropic
-        from .config import ANTHROPIC_API_KEY
-
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        client = _get_proxy_client()
 
         message = client.messages.create(
             model=_PROXY_MODEL,
@@ -479,11 +621,17 @@ def call_claude_as_proxy(tool_instruction: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # Tool executors — each follows the pattern:
-#   1. If credentials exist → try direct API
-#   2. If direct API raises an auth error → fall back to proxy
-#   3. If no credentials → fall back to proxy immediately
-#   4. Write tools without credentials → return content for manual action
+#   1. If credentials exist -> try direct API
+#   2. If direct API raises an auth error -> fall back to proxy
+#   3. If no credentials -> fall back to proxy immediately
+#   4. Write tools without credentials -> return content for manual action
+#      (NEVER proxied — write operations are a security boundary)
 # ---------------------------------------------------------------------------
+
+def _escape_drive_query(text: str) -> str:
+    """Escape single quotes in a Drive API query value (Fix #3)."""
+    return text.replace("\\", "\\\\").replace("'", "\\'")
+
 
 def _exec_search_google_drive(inputs: dict) -> dict:
     """Search Google Drive via the Drive API, or fallback to Claude proxy."""
@@ -491,32 +639,25 @@ def _exec_search_google_drive(inputs: dict) -> dict:
     file_type = inputs.get("file_type", "any")
     max_results = inputs.get("max_results", 10)
 
+    proxy_schema = '{"results": [{"name": "...", "id": "...", "type": "...", "modified": "...", "url": "..."}], "total": N}'
+
     if not _is_google_configured():
         return call_claude_as_proxy(
-            f"Search Google Drive for documents matching: {query}. "
-            f"File type filter: {file_type}. "
-            f"Return top {max_results} results as JSON with this exact structure: "
-            f'{{"results": [{{"name": "...", "id": "...", "type": "...", "modified": "...", "url": "..."}}], "total": N}}'
+            _proxy_instruction(
+                f"Search Google Drive for documents matching: {query}",
+                f"File type filter: {file_type}. Return top {max_results} results. ",
+                proxy_schema,
+            )
         )
 
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2 import service_account
-        import os
-
-        creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-        creds = service_account.Credentials.from_service_account_file(
-            creds_path,
-            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        service = _get_google_service(
+            "drive", "v3", ["https://www.googleapis.com/auth/drive.readonly"],
         )
-        delegate_email = os.getenv("GOOGLE_DELEGATE_EMAIL")
-        if delegate_email:
-            creds = creds.with_subject(delegate_email)
 
-        service = build("drive", "v3", credentials=creds)
-
-        # Build Drive API query
-        q_parts = [f"fullText contains '{query}'"]
+        # Build Drive API query (Fix #3: escape single quotes)
+        escaped_query = _escape_drive_query(query)
+        q_parts = [f"fullText contains '{escaped_query}'"]
         mime_map = {
             "document": "application/vnd.google-apps.document",
             "spreadsheet": "application/vnd.google-apps.spreadsheet",
@@ -554,10 +695,11 @@ def _exec_search_google_drive(inputs: dict) -> dict:
         if _is_auth_error(e):
             logger.warning("Google Drive auth error, falling back to Claude proxy: %s", e)
             return call_claude_as_proxy(
-                f"Search Google Drive for documents matching: {query}. "
-                f"File type filter: {file_type}. "
-                f"Return top {max_results} results as JSON with this exact structure: "
-                f'{{"results": [{{"name": "...", "id": "...", "type": "...", "modified": "...", "url": "..."}}], "total": N}}'
+                _proxy_instruction(
+                    f"Search Google Drive for documents matching: {query}",
+                    f"File type filter: {file_type}. Return top {max_results} results. ",
+                    proxy_schema,
+                )
             )
         return {"error": f"Google Drive search failed: {e}"}
 
@@ -566,28 +708,20 @@ def _exec_read_google_drive_document(inputs: dict) -> dict:
     """Read a Google Drive document's content, or fallback to Claude proxy."""
     file_id = inputs["file_id"]
 
+    proxy_schema = '{"file_id": "...", "content": "full text content here"}'
+
     if not _is_google_configured():
         return call_claude_as_proxy(
-            f"Read the content of the Google Drive document with ID or URL: {file_id}. "
-            f"Return the document content as JSON with this exact structure: "
-            f'{{"file_id": "...", "content": "full text content here"}}'
+            _proxy_instruction(
+                f"Read the content of the Google Drive document with ID or URL: {file_id}",
+                "", proxy_schema,
+            )
         )
 
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2 import service_account
-        import os
-
-        creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-        creds = service_account.Credentials.from_service_account_file(
-            creds_path,
-            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        service = _get_google_service(
+            "drive", "v3", ["https://www.googleapis.com/auth/drive.readonly"],
         )
-        delegate_email = os.getenv("GOOGLE_DELEGATE_EMAIL")
-        if delegate_email:
-            creds = creds.with_subject(delegate_email)
-
-        service = build("drive", "v3", credentials=creds)
 
         # Extract ID from URL if full URL provided
         if "drive.google.com" in file_id:
@@ -612,9 +746,10 @@ def _exec_read_google_drive_document(inputs: dict) -> dict:
         if _is_auth_error(e):
             logger.warning("Google Drive auth error, falling back to Claude proxy: %s", e)
             return call_claude_as_proxy(
-                f"Read the content of the Google Drive document with ID or URL: {file_id}. "
-                f"Return the document content as JSON with this exact structure: "
-                f'{{"file_id": "...", "content": "full text content here"}}'
+                _proxy_instruction(
+                    f"Read the content of the Google Drive document with ID or URL: {file_id}",
+                    "", proxy_schema,
+                )
             )
         return {"error": f"Failed to read document: {e}"}
 
@@ -624,44 +759,61 @@ def _exec_search_gmail(inputs: dict) -> dict:
     query = inputs["query"]
     max_results = inputs.get("max_results", 10)
 
+    proxy_schema = '{"results": [{"id": "...", "subject": "...", "from": "...", "date": "...", "snippet": "..."}], "total": N}'
+
     if not _is_google_configured():
         return call_claude_as_proxy(
-            f"Search Gmail for: {query}. "
-            f"Return top {max_results} results as JSON with this exact structure: "
-            f'{{"results": [{{"id": "...", "subject": "...", "from": "...", "date": "...", "snippet": "..."}}], "total": N}}'
+            _proxy_instruction(
+                f"Search Gmail for: {query}",
+                f"Return top {max_results} results. ",
+                proxy_schema,
+            )
         )
 
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2 import service_account
-        import os
-
-        creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-        creds = service_account.Credentials.from_service_account_file(
-            creds_path,
-            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        service = _get_google_service(
+            "gmail", "v1", ["https://www.googleapis.com/auth/gmail.readonly"],
         )
-        delegate_email = os.getenv("GOOGLE_DELEGATE_EMAIL")
-        if delegate_email:
-            creds = creds.with_subject(delegate_email)
 
-        service = build("gmail", "v1", credentials=creds)
-
-        results = service.users().messages().list(
+        # Fix #14: Use batch-compatible approach — request list with message
+        # IDs, then use a single batch request to fetch metadata for all.
+        list_result = service.users().messages().list(
             userId="me",
             q=query,
             maxResults=max_results,
         ).execute()
 
-        messages = []
-        for msg_stub in results.get("messages", []):
-            msg = service.users().messages().get(
-                userId="me",
-                id=msg_stub["id"],
-                format="metadata",
-                metadataHeaders=["Subject", "From", "Date"],
-            ).execute()
+        msg_stubs = list_result.get("messages", [])
+        if not msg_stubs:
+            return {"results": [], "total": 0}
 
+        # Batch fetch all message metadata in one round-trip
+        messages = []
+        batch_results: dict[str, Any] = {}
+
+        def _on_batch_response(request_id, response, exception):
+            if exception:
+                logger.warning("Batch Gmail get failed for %s: %s", request_id, exception)
+            else:
+                batch_results[request_id] = response
+
+        batch = service.new_batch_http_request(callback=_on_batch_response)
+        for stub in msg_stubs:
+            batch.add(
+                service.users().messages().get(
+                    userId="me",
+                    id=stub["id"],
+                    format="metadata",
+                    metadataHeaders=["Subject", "From", "Date"],
+                ),
+                request_id=stub["id"],
+            )
+        batch.execute()
+
+        for stub in msg_stubs:
+            msg = batch_results.get(stub["id"])
+            if not msg:
+                continue
             headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
             messages.append({
                 "id": msg["id"],
@@ -679,9 +831,11 @@ def _exec_search_gmail(inputs: dict) -> dict:
         if _is_auth_error(e):
             logger.warning("Gmail auth error, falling back to Claude proxy: %s", e)
             return call_claude_as_proxy(
-                f"Search Gmail for: {query}. "
-                f"Return top {max_results} results as JSON with this exact structure: "
-                f'{{"results": [{{"id": "...", "subject": "...", "from": "...", "date": "...", "snippet": "..."}}], "total": N}}'
+                _proxy_instruction(
+                    f"Search Gmail for: {query}",
+                    f"Return top {max_results} results. ",
+                    proxy_schema,
+                )
             )
         return {"error": f"Gmail search failed: {e}"}
 
@@ -690,29 +844,22 @@ def _exec_read_gmail_message(inputs: dict) -> dict:
     """Read a full Gmail message, or fallback to Claude proxy."""
     message_id = inputs["message_id"]
 
+    proxy_schema = '{"id": "...", "subject": "...", "from": "...", "to": "...", "date": "...", "body": "full email body"}'
+
     if not _is_google_configured():
         return call_claude_as_proxy(
-            f"Read the full Gmail message with ID: {message_id}. "
-            f"Return the message as JSON with this exact structure: "
-            f'{{"id": "...", "subject": "...", "from": "...", "to": "...", "date": "...", "body": "full email body"}}'
+            _proxy_instruction(
+                f"Read the full Gmail message with ID: {message_id}",
+                "", proxy_schema,
+            )
         )
 
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2 import service_account
-        import os
         import base64
 
-        creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-        creds = service_account.Credentials.from_service_account_file(
-            creds_path,
-            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        service = _get_google_service(
+            "gmail", "v1", ["https://www.googleapis.com/auth/gmail.readonly"],
         )
-        delegate_email = os.getenv("GOOGLE_DELEGATE_EMAIL")
-        if delegate_email:
-            creds = creds.with_subject(delegate_email)
-
-        service = build("gmail", "v1", credentials=creds)
 
         msg = service.users().messages().get(
             userId="me",
@@ -748,58 +895,40 @@ def _exec_read_gmail_message(inputs: dict) -> dict:
         if _is_auth_error(e):
             logger.warning("Gmail auth error, falling back to Claude proxy: %s", e)
             return call_claude_as_proxy(
-                f"Read the full Gmail message with ID: {message_id}. "
-                f"Return the message as JSON with this exact structure: "
-                f'{{"id": "...", "subject": "...", "from": "...", "to": "...", "date": "...", "body": "full email body"}}'
+                _proxy_instruction(
+                    f"Read the full Gmail message with ID: {message_id}",
+                    "", proxy_schema,
+                )
             )
         return {"error": f"Failed to read message: {e}"}
 
 
 def _exec_draft_gmail(inputs: dict) -> dict:
-    """Create a Gmail draft, or fallback to Claude proxy / manual content."""
+    """
+    Create a Gmail draft, or return content for manual action.
+
+    Security: Write operations are NEVER proxied. Without direct credentials,
+    the content is returned as manual_fallback for the CEO to send.
+    """
+    # Fix #6: Write operations without credentials -> always manual fallback
     if not _is_google_configured():
-        # Try via Claude proxy first (it may have Gmail write access)
-        proxy_result = call_claude_as_proxy(
-            f"Create a Gmail draft with the following details:\n"
-            f"To: {inputs['to']}\n"
-            f"Subject: {inputs['subject']}\n"
-            f"Body: {inputs['body']}\n"
-            f"CC: {inputs.get('cc', '')}\n\n"
-            f"If you can create the draft, return JSON: "
-            f'{{"status": "draft_created", "draft_id": "...", "to": "...", "subject": "..."}}. '
-            f"If you cannot create the draft, return JSON: "
-            f'{{"status": "draft_not_created", "reason": "..."}}'
-        )
-        # If proxy couldn't create it, return content for manual sending
-        if proxy_result.get("status") != "draft_created":
-            return {
-                "source": "manual_fallback",
-                "status": "draft_not_created",
-                "note": "Sin acceso a Gmail. El borrador se muestra abajo para envío manual.",
-                "to": inputs["to"],
-                "subject": inputs["subject"],
-                "body": inputs["body"],
-                "cc": inputs.get("cc", ""),
-            }
-        return proxy_result
+        return {
+            "source": "manual_fallback",
+            "status": "draft_not_created",
+            "note": "Sin acceso a Gmail. El borrador se muestra abajo para envio manual.",
+            "to": inputs["to"],
+            "subject": inputs["subject"],
+            "body": inputs["body"],
+            "cc": inputs.get("cc", ""),
+        }
 
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2 import service_account
-        import os
         import base64
         from email.mime.text import MIMEText
 
-        creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-        creds = service_account.Credentials.from_service_account_file(
-            creds_path,
-            scopes=["https://www.googleapis.com/auth/gmail.compose"],
+        service = _get_google_service(
+            "gmail", "v1", ["https://www.googleapis.com/auth/gmail.compose"],
         )
-        delegate_email = os.getenv("GOOGLE_DELEGATE_EMAIL")
-        if delegate_email:
-            creds = creds.with_subject(delegate_email)
-
-        service = build("gmail", "v1", credentials=creds)
 
         message = MIMEText(inputs["body"])
         message["to"] = inputs["to"]
@@ -824,29 +953,16 @@ def _exec_draft_gmail(inputs: dict) -> dict:
         return {"error": "google-api-python-client not installed. Run: pip install google-api-python-client google-auth"}
     except Exception as e:
         if _is_auth_error(e):
-            logger.warning("Gmail auth error on draft, falling back to Claude proxy: %s", e)
-            proxy_result = call_claude_as_proxy(
-                f"Create a Gmail draft with the following details:\n"
-                f"To: {inputs['to']}\n"
-                f"Subject: {inputs['subject']}\n"
-                f"Body: {inputs['body']}\n"
-                f"CC: {inputs.get('cc', '')}\n\n"
-                f"If you can create the draft, return JSON: "
-                f'{{"status": "draft_created", "draft_id": "...", "to": "...", "subject": "..."}}. '
-                f"If you cannot, return JSON: "
-                f'{{"status": "draft_not_created", "reason": "..."}}'
-            )
-            if proxy_result.get("status") != "draft_created":
-                return {
-                    "source": "manual_fallback",
-                    "status": "draft_not_created",
-                    "note": "Auth error y proxy sin acceso. El borrador se muestra abajo para envío manual.",
-                    "to": inputs["to"],
-                    "subject": inputs["subject"],
-                    "body": inputs["body"],
-                    "cc": inputs.get("cc", ""),
-                }
-            return proxy_result
+            logger.warning("Gmail auth error on draft — returning manual fallback: %s", e)
+            return {
+                "source": "manual_fallback",
+                "status": "draft_not_created",
+                "note": "Auth error. El borrador se muestra abajo para envio manual.",
+                "to": inputs["to"],
+                "subject": inputs["subject"],
+                "body": inputs["body"],
+                "cc": inputs.get("cc", ""),
+            }
         return {"error": f"Failed to create draft: {e}"}
 
 
@@ -855,18 +971,19 @@ def _exec_search_slack(inputs: dict) -> dict:
     query = inputs["query"]
     max_results = inputs.get("max_results", 10)
 
+    proxy_schema = '{"results": [{"text": "...", "user": "...", "channel": "...", "timestamp": "...", "permalink": "..."}], "total": N}'
+
     if not _is_slack_configured():
         return call_claude_as_proxy(
-            f"Search Slack for messages matching: {query}. "
-            f"Return top {max_results} results as JSON with this exact structure: "
-            f'{{"results": [{{"text": "...", "user": "...", "channel": "...", "timestamp": "...", "permalink": "..."}}], "total": N}}'
+            _proxy_instruction(
+                f"Search Slack for messages matching: {query}",
+                f"Return top {max_results} results. ",
+                proxy_schema,
+            )
         )
 
     try:
-        from slack_sdk import WebClient
-        import os
-
-        client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+        client = _get_slack_client()
 
         result = client.search_messages(
             query=query,
@@ -893,9 +1010,11 @@ def _exec_search_slack(inputs: dict) -> dict:
         if _is_auth_error(e):
             logger.warning("Slack auth error, falling back to Claude proxy: %s", e)
             return call_claude_as_proxy(
-                f"Search Slack for messages matching: {query}. "
-                f"Return top {max_results} results as JSON with this exact structure: "
-                f'{{"results": [{{"text": "...", "user": "...", "channel": "...", "timestamp": "...", "permalink": "..."}}], "total": N}}'
+                _proxy_instruction(
+                    f"Search Slack for messages matching: {query}",
+                    f"Return top {max_results} results. ",
+                    proxy_schema,
+                )
             )
         return {"error": f"Slack search failed: {e}"}
 
@@ -905,18 +1024,18 @@ def _exec_read_slack_thread(inputs: dict) -> dict:
     channel_id = inputs["channel_id"]
     thread_ts = inputs["thread_ts"]
 
+    proxy_schema = '{"messages": [{"user": "...", "text": "...", "timestamp": "..."}], "total": N}'
+
     if not _is_slack_configured():
         return call_claude_as_proxy(
-            f"Read the Slack thread in channel {channel_id} with parent timestamp {thread_ts}. "
-            f"Return all thread messages as JSON with this exact structure: "
-            f'{{"messages": [{{"user": "...", "text": "...", "timestamp": "..."}}], "total": N}}'
+            _proxy_instruction(
+                f"Read the Slack thread in channel {channel_id} with parent timestamp {thread_ts}",
+                "", proxy_schema,
+            )
         )
 
     try:
-        from slack_sdk import WebClient
-        import os
-
-        client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+        client = _get_slack_client()
 
         result = client.conversations_replies(
             channel=channel_id,
@@ -940,42 +1059,34 @@ def _exec_read_slack_thread(inputs: dict) -> dict:
         if _is_auth_error(e):
             logger.warning("Slack auth error, falling back to Claude proxy: %s", e)
             return call_claude_as_proxy(
-                f"Read the Slack thread in channel {channel_id} with parent timestamp {thread_ts}. "
-                f"Return all thread messages as JSON with this exact structure: "
-                f'{{"messages": [{{"user": "...", "text": "...", "timestamp": "..."}}], "total": N}}'
+                _proxy_instruction(
+                    f"Read the Slack thread in channel {channel_id} with parent timestamp {thread_ts}",
+                    "", proxy_schema,
+                )
             )
         return {"error": f"Failed to read thread: {e}"}
 
 
 def _exec_send_slack_message(inputs: dict) -> dict:
-    """Send a Slack message, or fallback to Claude proxy / manual content."""
+    """
+    Send a Slack message, or return content for manual action.
+
+    Security: Write operations are NEVER proxied. Without direct credentials,
+    the content is returned as manual_fallback for the CEO to send.
+    """
+    # Fix #6: Write operations without credentials -> always manual fallback
     if not _is_slack_configured():
-        # Try via Claude proxy first (it may have Slack write access)
-        proxy_result = call_claude_as_proxy(
-            f"Send a Slack message to channel: {inputs['channel']}\n"
-            f"Message text: {inputs['text']}\n"
-            f"Thread timestamp (if reply): {inputs.get('thread_ts', 'none')}\n\n"
-            f"If you can send the message, return JSON: "
-            f'{{"status": "sent", "channel": "...", "timestamp": "..."}}. '
-            f"If you cannot, return JSON: "
-            f'{{"status": "message_not_sent", "reason": "..."}}'
-        )
-        if proxy_result.get("status") != "sent":
-            return {
-                "source": "manual_fallback",
-                "status": "message_not_sent",
-                "note": "Sin acceso a Slack. El mensaje se muestra abajo para envío manual.",
-                "channel": inputs["channel"],
-                "text": inputs["text"],
-                "thread_ts": inputs.get("thread_ts", ""),
-            }
-        return proxy_result
+        return {
+            "source": "manual_fallback",
+            "status": "message_not_sent",
+            "note": "Sin acceso a Slack. El mensaje se muestra abajo para envio manual.",
+            "channel": inputs["channel"],
+            "text": inputs["text"],
+            "thread_ts": inputs.get("thread_ts", ""),
+        }
 
     try:
-        from slack_sdk import WebClient
-        import os
-
-        client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+        client = _get_slack_client()
 
         kwargs = {
             "channel": inputs["channel"],
@@ -996,26 +1107,15 @@ def _exec_send_slack_message(inputs: dict) -> dict:
         return {"error": "slack-sdk not installed. Run: pip install slack-sdk"}
     except Exception as e:
         if _is_auth_error(e):
-            logger.warning("Slack auth error on send, falling back to Claude proxy: %s", e)
-            proxy_result = call_claude_as_proxy(
-                f"Send a Slack message to channel: {inputs['channel']}\n"
-                f"Message text: {inputs['text']}\n"
-                f"Thread timestamp (if reply): {inputs.get('thread_ts', 'none')}\n\n"
-                f"If you can send the message, return JSON: "
-                f'{{"status": "sent", "channel": "...", "timestamp": "..."}}. '
-                f"If you cannot, return JSON: "
-                f'{{"status": "message_not_sent", "reason": "..."}}'
-            )
-            if proxy_result.get("status") != "sent":
-                return {
-                    "source": "manual_fallback",
-                    "status": "message_not_sent",
-                    "note": "Auth error y proxy sin acceso. El mensaje se muestra abajo para envío manual.",
-                    "channel": inputs["channel"],
-                    "text": inputs["text"],
-                    "thread_ts": inputs.get("thread_ts", ""),
-                }
-            return proxy_result
+            logger.warning("Slack auth error on send — returning manual fallback: %s", e)
+            return {
+                "source": "manual_fallback",
+                "status": "message_not_sent",
+                "note": "Auth error. El mensaje se muestra abajo para envio manual.",
+                "channel": inputs["channel"],
+                "text": inputs["text"],
+                "thread_ts": inputs.get("thread_ts", ""),
+            }
         return {"error": f"Failed to send message: {e}"}
 
 
@@ -1024,30 +1124,23 @@ def _exec_read_calendar(inputs: dict) -> dict:
     days = inputs.get("days_ahead", 7)
     query = inputs.get("query", "")
 
+    proxy_schema = '{"events": [{"summary": "...", "start": "...", "end": "...", "description": "...", "attendees": ["..."]}], "total": N}'
+
     if not _is_google_configured():
         return call_claude_as_proxy(
-            f"Read upcoming Google Calendar events for the next {days} days. "
-            f"Filter: {query or 'all events'}. "
-            f"Return events as JSON with this exact structure: "
-            f'{{"events": [{{"summary": "...", "start": "...", "end": "...", "description": "...", "attendees": ["..."]}}], "total": N}}'
+            _proxy_instruction(
+                f"Read upcoming Google Calendar events for the next {days} days",
+                f"Filter: {query or 'all events'}. ",
+                proxy_schema,
+            )
         )
 
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2 import service_account
         from datetime import datetime, timedelta, timezone
-        import os
 
-        creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-        creds = service_account.Credentials.from_service_account_file(
-            creds_path,
-            scopes=["https://www.googleapis.com/auth/calendar.readonly"],
+        service = _get_google_service(
+            "calendar", "v3", ["https://www.googleapis.com/auth/calendar.readonly"],
         )
-        delegate_email = os.getenv("GOOGLE_DELEGATE_EMAIL")
-        if delegate_email:
-            creds = creds.with_subject(delegate_email)
-
-        service = build("calendar", "v3", credentials=creds)
 
         now = datetime.now(timezone.utc)
         time_max = now + timedelta(days=days)
@@ -1081,10 +1174,11 @@ def _exec_read_calendar(inputs: dict) -> dict:
         if _is_auth_error(e):
             logger.warning("Calendar auth error, falling back to Claude proxy: %s", e)
             return call_claude_as_proxy(
-                f"Read upcoming Google Calendar events for the next {days} days. "
-                f"Filter: {query or 'all events'}. "
-                f"Return events as JSON with this exact structure: "
-                f'{{"events": [{{"summary": "...", "start": "...", "end": "...", "description": "...", "attendees": ["..."]}}], "total": N}}'
+                _proxy_instruction(
+                    f"Read upcoming Google Calendar events for the next {days} days",
+                    f"Filter: {query or 'all events'}. ",
+                    proxy_schema,
+                )
             )
         return {"error": f"Calendar read failed: {e}"}
 

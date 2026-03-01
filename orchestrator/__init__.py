@@ -32,7 +32,7 @@ Usage:
     results = investigate(topic="análisis regulatorio CMF")
 """
 
-from .agent_runner import run_agent as _run_agent
+from .agent_runner import run_agent as _run_agent, RunMetrics, last_metrics
 from .pipeline import run_pipeline as _run_pipeline, resume_pipeline as _resume_pipeline
 from .gates import DEFAULT_GATES, GateHandler, terminal_gate, auto_gate
 from .tools import call_claude_as_proxy
@@ -216,6 +216,8 @@ __all__ = [
     "context",
     "list_agents",
     "call_claude_as_proxy",
+    "RunMetrics",
+    "last_metrics",
     "DEFAULT_GATES",
     "auto_gate",
     "terminal_gate",

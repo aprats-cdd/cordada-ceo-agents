@@ -16,7 +16,9 @@ CLI usage:
 import argparse
 import logging
 import sys
+import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -41,15 +43,50 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 2  # seconds
 
 
-# Shared client — created once, reused across calls
+# ---------------------------------------------------------------------------
+# RunMetrics — observability for every agent invocation (Fix #7)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunMetrics:
+    """Metrics collected during a single agent run."""
+    agent: str = ""
+    model: str = ""
+    latency_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    tool_calls: int = 0
+    tool_rounds: int = 0
+    proxy_calls: int = 0
+
+    def __str__(self) -> str:
+        return (
+            f"[{self.agent}] {self.model} — "
+            f"{self.latency_ms}ms, "
+            f"{self.input_tokens}+{self.output_tokens} tokens, "
+            f"{self.tool_calls} tool calls ({self.tool_rounds} rounds)"
+        )
+
+
+# Module-level metrics for the last run (inspectable by callers)
+last_metrics: RunMetrics = RunMetrics()
+
+
+# ---------------------------------------------------------------------------
+# Thread-safe lazy singleton for Anthropic client (Fix #11)
+# ---------------------------------------------------------------------------
+
 _client: anthropic.Anthropic | None = None
+_client_lock = threading.Lock()
 
 
 def _get_client() -> anthropic.Anthropic:
-    """Get or create the shared Anthropic client."""
+    """Get or create the shared Anthropic client (thread-safe)."""
     global _client
     if _client is None:
-        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        with _client_lock:
+            if _client is None:  # double-check locking
+                _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     return _client
 
 
@@ -122,8 +159,12 @@ def run_agent(
     Returns:
         The agent's response text
     """
+    global last_metrics
+    metrics = RunMetrics(agent=agent_name, model=get_model(agent_name))
+    start_time = time.monotonic()
+
     system_prompt = get_agent_prompt(agent_name)
-    model = get_model(agent_name)
+    model = metrics.model
     client = _get_client()
 
     # Get tools for this agent (may be empty)
@@ -153,11 +194,22 @@ def run_agent(
             tools=tools or None,
         )
 
+        # Accumulate token counts from initial call
+        metrics.input_tokens += getattr(message.usage, "input_tokens", 0)
+        metrics.output_tokens += getattr(message.usage, "output_tokens", 0)
+
         # Tool execution loop: when the model requests tool use, execute
         # the tool and send the result back until we get a final response.
         response = _handle_tool_loop(
-            client, model, system_prompt, messages, message, tools, agent_name, verbose
+            client, model, system_prompt, messages, message, tools, agent_name, verbose,
+            metrics=metrics,
         )
+
+    metrics.latency_ms = int((time.monotonic() - start_time) * 1000)
+    last_metrics = metrics
+
+    if verbose:
+        logger.info("Metrics: %s", metrics)
 
     # Save output
     if output_path:
@@ -191,6 +243,7 @@ def _handle_tool_loop(
     agent_name: str,
     verbose: bool,
     max_tool_rounds: int = 10,
+    metrics: RunMetrics | None = None,
 ) -> str:
     """
     Handle the tool execution loop.
@@ -231,6 +284,9 @@ def _handle_tool_loop(
                 "content": result,
             })
 
+            if metrics:
+                metrics.tool_calls += 1
+
         # Send the assistant's response (with tool_use blocks) and our
         # tool_result messages back to the API to continue
         messages.append({"role": "assistant", "content": message.content})
@@ -244,6 +300,14 @@ def _handle_tool_loop(
             messages=messages,
             tools=tools or None,
         )
+
+        # Accumulate token counts from tool-loop iterations
+        if metrics:
+            metrics.input_tokens += getattr(message.usage, "input_tokens", 0)
+            metrics.output_tokens += getattr(message.usage, "output_tokens", 0)
+
+    if metrics:
+        metrics.tool_rounds = rounds
 
     if rounds >= max_tool_rounds:
         logger.warning(
