@@ -34,12 +34,12 @@ from .gates import (
 )
 
 
-# Pipeline sequences
-DEFAULT_PIPELINE = ["discover", "extract", "validate", "compile", "audit", "reflect"]
-
+# Pipeline sequences — all agents that can participate in a pipeline run.
+# DECIDE and COLLECT_ITERATE have mandatory gates (require CEO intervention).
 FULL_PIPELINE = [
     "discover", "extract", "validate", "compile",
-    "audit", "reflect", "distribute",
+    "audit", "reflect", "decide", "distribute",
+    "collect_iterate",
 ]
 
 
@@ -134,16 +134,44 @@ def run_pipeline(
         total = len(sequence)
         model = get_model(agent_name)
 
-        # Build input for this agent
+        # Build input for this agent — carry forward accumulated context
         if i > 0:
             prev_agent = sequence[i - 1]
+
+            # Build context summary from prior outputs (truncated for token budget)
+            prior_summaries = []
+            for prev_name, prev_output in outputs.items():
+                if prev_name == prev_agent:
+                    continue  # Full output included below
+                # Include first 600 chars of each prior agent's output
+                truncated = prev_output[:600]
+                if len(prev_output) > 600:
+                    truncated += "\n[... truncado]"
+                prior_summaries.append(f"### {prev_name.upper()}\n{truncated}")
+
+            context_header = (
+                f"[MODO PIPELINE — Procesa directamente, no hagas preguntas]\n\n"
+                f"**Topic original:** {topic or 'N/A'}\n\n"
+            )
+
+            if prior_summaries:
+                context_header += (
+                    f"**Contexto acumulado del pipeline:**\n\n"
+                    + "\n\n---\n\n".join(prior_summaries)
+                    + "\n\n---\n\n"
+                )
+
             pipeline_context = (
-                f"Este es el output del agente {prev_agent.upper()} del pipeline. "
-                f"Procesa este input según tus instrucciones:\n\n"
-                f"---\n\n{current_input}"
+                f"{context_header}"
+                f"**Output completo del agente {prev_agent.upper()}:**\n\n"
+                f"{current_input}"
             )
         else:
-            pipeline_context = current_input
+            pipeline_context = (
+                f"[MODO PIPELINE — Procesa directamente, no hagas preguntas]\n\n"
+                f"**Topic:** {topic or 'N/A'}\n\n"
+                f"{current_input}"
+            )
 
         # Gate check: pause for human review before running this agent
         if agent_name in gates:
@@ -380,7 +408,7 @@ Examples:
     parser.add_argument("--topic", type=str, help="Research topic")
     parser.add_argument("--input-file", type=str, help="File to use as input")
     parser.add_argument("--from", dest="from_agent", default="discover", choices=list(AGENTS.keys()))
-    parser.add_argument("--to", dest="to_agent", default="reflect", choices=list(AGENTS.keys()))
+    parser.add_argument("--to", dest="to_agent", default="decide", choices=list(AGENTS.keys()))
     parser.add_argument("--interactive-at", nargs="*", default=[], choices=list(AGENTS.keys()))
     parser.add_argument("--project", type=str, help="Project name for GitHub traceability")
     parser.add_argument("--project-description", type=str)

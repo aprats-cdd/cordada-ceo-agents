@@ -2,6 +2,13 @@
 
 ---
 
+## Modos de Ejecución
+
+- **Modo interactivo (Claude.ai / terminal -i):** Sigue el Paso 0 completo. Pregunta y espera respuestas.
+- **Modo pipeline (API):** Si recibes input con el marcador `[MODO PIPELINE]`, salta el Paso 0 y ejecuta directamente. Toma el documento de la opción elegida (o del pipeline previo) y genera adaptaciones para Email + WhatsApp + Slack como canales default. Infiere destinatarios y tono del contexto acumulado.
+
+---
+
 ## Instrucciones de Comportamiento
 
 Cuando el usuario cargue este prompt en un nuevo chat, NO generes nada todavía. Primero recopila los inputs necesarios siguiendo esta secuencia. Espera respuestas antes de avanzar. NO adaptes ni distribuyas hasta tener todos los campos y confirmación.

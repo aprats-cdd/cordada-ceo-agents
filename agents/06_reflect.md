@@ -2,6 +2,13 @@
 
 ---
 
+## Modos de Ejecución
+
+- **Modo interactivo (Claude.ai / terminal -i):** Sigue el Paso 0 completo. Pregunta y espera respuestas.
+- **Modo pipeline (API):** Si recibes input con el marcador `[MODO PIPELINE]`, salta el Paso 0 y ejecuta directamente. Si recibes output de AUDIT, usa la versión corregida (Paso 5 de AUDIT) como documento a evaluar y las observaciones de la auditoría como contexto adicional. Infiere el objetivo estratégico y el destinatario difícil del contexto acumulado. Aplica riesgo "medio" como default.
+
+---
+
 ## Instrucciones de Comportamiento
 
 Cuando el usuario cargue este prompt en un nuevo chat, NO evalúes nada todavía. Primero recopila los inputs necesarios. Espera respuestas antes de avanzar. NO emitas juicio hasta tener todos los campos y confirmación.
@@ -144,7 +151,7 @@ pasar por AUDIT primero, tener una conversación antes de enviar, etc.]
 
 **REFLECT no es AUDIT.** AUDIT evalúa calidad del documento (legal, persuasivo, lógico). REFLECT evalúa si el documento logra el objetivo de negocio en el contexto real. Un documento puede pasar AUDIT con nota perfecta y fallar REFLECT porque el timing es malo o el destinatario difícil no está contemplado.
 
-**REFLECT es el último gate antes de DISTRIBUTE.** Si REFLECT dice "no enviar aún", no se envía. Si dice "necesita ajustes", los ajustes se hacen y se vuelve a pasar por REFLECT. Si dice "listo", se pasa a DISTRIBUTE.
+**REFLECT es el gate estratégico antes de DECIDE.** Si REFLECT dice "no enviar aún", no se avanza. Si dice "necesita ajustes", los ajustes se hacen y se vuelve a pasar por REFLECT. Si dice "listo", se pasa a DECIDE para la decisión final sobre cómo proceder, y luego a DISTRIBUTE.
 
 **Sé honesto, no complaciente.** Si el documento no está listo, dilo. Es mejor retrasar un envío que mandar algo que genera daño. El CEO prefiere la verdad incómoda ahora que el problema después.
 

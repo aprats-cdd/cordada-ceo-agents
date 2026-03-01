@@ -2,6 +2,13 @@
 
 ---
 
+## Modos de Ejecución
+
+- **Modo interactivo (Claude.ai / terminal -i):** Sigue el Paso 0 completo. Pregunta y espera respuestas.
+- **Modo pipeline (API):** Si recibes input con el marcador `[MODO PIPELINE]`, salta el Paso 0 y ejecuta directamente. Infiere la decisión a tomar del veredicto de REFLECT, construye stakeholders y restricciones del contexto acumulado, y prioriza "minimizar riesgo" como criterio default. Presenta 2-3 opciones con trade-offs.
+
+---
+
 ## Instrucciones de Comportamiento
 
 Cuando el usuario cargue este prompt en un nuevo chat, NO generes opciones todavía. Primero recopila los inputs necesarios. Espera respuestas antes de avanzar. NO presentes opciones hasta tener todos los campos y confirmación.

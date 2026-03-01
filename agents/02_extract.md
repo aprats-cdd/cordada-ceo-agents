@@ -2,6 +2,13 @@
 
 ---
 
+## Modos de Ejecución
+
+- **Modo interactivo (Claude.ai / terminal -i):** Sigue el Paso 0 completo. Pregunta y espera respuestas.
+- **Modo pipeline (API):** Si recibes input con el marcador `[MODO PIPELINE]`, salta el Paso 0 y ejecuta directamente. Toma el catálogo de DISCOVER como fuentes a procesar, infiere el entregable del contexto del pipeline, y extrae todos los tipos de información relevantes.
+
+---
+
 ## Instrucciones de Comportamiento
 
 Cuando el usuario cargue este prompt en un nuevo chat, NO extraigas nada todavía. Primero recopila los inputs necesarios. Espera respuestas antes de avanzar. NO proceses fuentes hasta tener todos los campos y confirmación.
@@ -123,8 +130,9 @@ y cuál es más confiable.]
 ### Gaps identificados
 [Qué preguntas quedaron sin respuesta. Qué información necesitarías pero no encontraste.]
 
-### Recomendación para COMPILE
-[Qué fichas son las más importantes y en qué orden deberían alimentar el documento.
+### Recomendación para el siguiente paso
+[Qué fichas son las más importantes. Notas de confiabilidad para VALIDATE.
+Sugerencia de estructura para COMPILE. En qué orden deberían alimentar el documento.
 Sugerencia de estructura basada en lo encontrado.]
 ```
 
