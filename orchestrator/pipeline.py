@@ -31,7 +31,7 @@ from domain.evaluation import evaluate_structural
 
 from .config import OUTPUTS_DIR, COST_BUDGET_MAX_USD, COST_MAX_OUTPUT_TOKENS, COST_MAX_ITERATIONS
 from .agent_runner import run_agent, last_metrics
-from .canonical import evaluate_output
+from .heuristic_eval import evaluate_output
 from .contract_parser import try_parse, get_schema_instruction, get_retry_prompt
 from .gates import (
     GateContext,
@@ -512,7 +512,7 @@ def _run_pipeline_loop(
                               f"[{canon.phase.value}] as {canon.canonical_referent[:50]}...")
                         eval_result = evaluate_output(agent_name, response)
                         if eval_result:
-                            print(f"  Score: {eval_result.score}/10 — {eval_result.reasoning}")
+                            print(f"  Señal heurística: {eval_result.score}/10 (no calibrada) — {eval_result.reasoning}")
                     else:
                         print(f"  Tier 1 failed ({structural.score:.0%}) — skipping Tier 2 (saves API call)")
 
