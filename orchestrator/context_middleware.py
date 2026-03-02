@@ -2,15 +2,21 @@
 CONTEXT Middleware — intercept agent questions in interactive mode,
 search internal sources (Drive, Gmail, Slack), and suggest answers.
 
+Uses the same tool executors from ``tools.py`` so the proxy fallback
+(Claude with MCP) is always available — even without direct API
+credentials configured.
+
 Flow:
     1. Agent produces a response containing questions for the user.
     2. ``suggest_answers()`` extracts the questions, searches all
-       configured sources, and returns a formatted suggestion block.
+       sources via the existing tool executors, and returns a
+       formatted suggestion block.
     3. The user confirms, corrects, or answers manually.
     4. ``compile_confirmed_answers()`` turns the confirmed suggestions
        into a plain-text reply for the agent.
 """
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -26,7 +32,7 @@ logger = logging.getLogger(__name__)
 class SourceHit:
     """A single search result from an internal source."""
     answer: str
-    source_type: str        # "Drive", "Gmail", "Slack", "Calendar"
+    source_type: str        # "Drive", "Gmail", "Slack"
     source_name: str        # document title, email subject, channel name…
     date: str               # ISO date or human-readable
     confidence: str         # "Alta", "Media", "Baja"
@@ -80,7 +86,7 @@ def extract_questions(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Source search helpers
+# Source search helpers — delegate to tools.py executors
 # ---------------------------------------------------------------------------
 
 def _keywords_from_question(question: str) -> str:
@@ -105,58 +111,78 @@ def _keywords_from_question(question: str) -> str:
     return " ".join(keywords)
 
 
-def _search_drive(query: str) -> list[SourceHit]:
-    """Search Google Drive and return SourceHit list."""
-    from .google_client import search_drive, is_google_configured
+def _parse_tool_result(raw: str) -> dict:
+    """Parse a JSON tool result string, returning {} on failure."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
-    if not is_google_configured():
+
+def _search_drive(query: str) -> list[SourceHit]:
+    """Search Google Drive via tools.py executor (with proxy fallback)."""
+    from .tools import execute_tool
+
+    raw = execute_tool("search_google_drive", {"query": query, "max_results": 5})
+    data = _parse_tool_result(raw)
+
+    if "error" in data:
+        logger.warning("Drive search error: %s", data["error"])
         return []
 
     hits: list[SourceHit] = []
-    for doc in search_drive(query):
+    for doc in data.get("results", []):
         hits.append(SourceHit(
-            answer=doc["snippet"] or doc["title"],
+            answer=doc.get("name", ""),
             source_type="Drive",
-            source_name=doc["title"],
-            date=doc["date"],
+            source_name=doc.get("name", ""),
+            date=doc.get("modified", "")[:10],
             confidence="Media",
         ))
     return hits
 
 
 def _search_gmail(query: str) -> list[SourceHit]:
-    """Search Gmail and return SourceHit list."""
-    from .google_client import search_gmail, is_google_configured
+    """Search Gmail via tools.py executor (with proxy fallback)."""
+    from .tools import execute_tool
 
-    if not is_google_configured():
+    raw = execute_tool("search_gmail", {"query": query, "max_results": 5})
+    data = _parse_tool_result(raw)
+
+    if "error" in data:
+        logger.warning("Gmail search error: %s", data["error"])
         return []
 
     hits: list[SourceHit] = []
-    for email in search_gmail(query):
+    for email in data.get("results", []):
         hits.append(SourceHit(
-            answer=email["snippet"],
+            answer=email.get("snippet", ""),
             source_type="Gmail",
-            source_name=f"{email['subject']} (de {email['from']})",
-            date=email["date"],
+            source_name=f"{email.get('subject', '')} (de {email.get('from', '')})",
+            date=email.get("date", ""),
             confidence="Media",
         ))
     return hits
 
 
 def _search_slack(query: str) -> list[SourceHit]:
-    """Search Slack messages and return SourceHit list."""
-    from .slack_client import search_slack, is_slack_configured
+    """Search Slack via tools.py executor (with proxy fallback)."""
+    from .tools import execute_tool
 
-    if not is_slack_configured():
+    raw = execute_tool("search_slack", {"query": query, "max_results": 5})
+    data = _parse_tool_result(raw)
+
+    if "error" in data:
+        logger.warning("Slack search error: %s", data["error"])
         return []
 
     hits: list[SourceHit] = []
-    for msg in search_slack(query):
+    for msg in data.get("results", []):
         hits.append(SourceHit(
-            answer=msg["text"],
+            answer=(msg.get("text") or "")[:300],
             source_type="Slack",
-            source_name=f"#{msg['channel']} (@{msg['user']})",
-            date=msg["date"],
+            source_name=f"#{msg.get('channel', '')} (@{msg.get('user', '')})",
+            date=msg.get("timestamp", ""),
             confidence="Baja",
         ))
     return hits
@@ -164,13 +190,12 @@ def _search_slack(query: str) -> list[SourceHit]:
 
 def _assign_confidence(hits: list[SourceHit]) -> None:
     """Upgrade confidence when multiple sources agree or source is formal."""
-    # Drive documents are treated as more authoritative
     for h in hits:
         if h.source_type == "Drive":
             h.confidence = "Alta"
         elif h.source_type == "Gmail":
             h.confidence = "Media"
-        # If we have hits from more than one source type, bump to Alta
+    # Multiple source types confirming → bump
     source_types = {h.source_type for h in hits}
     if len(source_types) > 1:
         for h in hits:
@@ -178,21 +203,16 @@ def _assign_confidence(hits: list[SourceHit]) -> None:
                 h.confidence = "Alta"
 
 
-def _search_all_sources(question: str, sources: set[str]) -> list[SourceHit]:
-    """Search all configured sources for a question."""
+def _search_all_sources(question: str) -> list[SourceHit]:
+    """Search Drive, Gmail, and Slack for a question."""
     keywords = _keywords_from_question(question)
     if not keywords:
         return []
 
     hits: list[SourceHit] = []
-
-    if "drive" in sources:
-        hits.extend(_search_drive(keywords))
-    if "gmail" in sources:
-        hits.extend(_search_gmail(keywords))
-    if "slack" in sources:
-        hits.extend(_search_slack(keywords))
-
+    hits.extend(_search_drive(keywords))
+    hits.extend(_search_gmail(keywords))
+    hits.extend(_search_slack(keywords))
     _assign_confidence(hits)
     return hits
 
@@ -201,70 +221,16 @@ def _search_all_sources(question: str, sources: set[str]) -> list[SourceHit]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def check_availability(sources: set[str]) -> tuple[bool, str]:
-    """Check if at least one source is properly configured.
-
-    Returns:
-        (available, warning_message)
-    """
-    from .google_client import is_google_configured
-    from .slack_client import is_slack_configured
-
-    available_sources: list[str] = []
-    missing: list[str] = []
-
-    if "drive" in sources or "gmail" in sources:
-        if is_google_configured():
-            if "drive" in sources:
-                available_sources.append("Drive")
-            if "gmail" in sources:
-                available_sources.append("Gmail")
-        else:
-            missing.append("Google (GOOGLE_CREDENTIALS_PATH + GOOGLE_DELEGATE_EMAIL)")
-
-    if "slack" in sources:
-        if is_slack_configured():
-            available_sources.append("Slack")
-        else:
-            missing.append("Slack (SLACK_BOT_TOKEN)")
-
-    if not available_sources:
-        warning = (
-            "  CONTEXT middleware habilitado pero las APIs no estan configuradas.\n"
-            "    Para configurar: edita .env con "
-            + " y ".join(missing)
-            + "\n    Continuando sin CONTEXT..."
-        )
-        return False, warning
-
-    if missing:
-        warning = (
-            "  CONTEXT: fuentes activas: "
-            + ", ".join(available_sources)
-            + ". No configuradas: "
-            + ", ".join(missing)
-        )
-        return True, warning
-
-    return True, ""
-
-
-def suggest_answers(
-    assistant_text: str,
-    sources: set[str] | None = None,
-) -> ContextResult | None:
+def suggest_answers(assistant_text: str) -> ContextResult | None:
     """Analyse an agent's response, search internal sources, return suggestions.
 
     Args:
         assistant_text: The raw text output from the agent.
-        sources: Which sources to search (default: {"drive", "gmail", "slack"}).
 
     Returns:
         A ``ContextResult`` with suggestions and unanswered questions,
         or ``None`` if the agent text contained no questions.
     """
-    sources = sources or {"drive", "gmail", "slack"}
-
     questions = extract_questions(assistant_text)
     if not questions:
         return None
@@ -273,7 +239,7 @@ def suggest_answers(
     unanswered: list[str] = []
 
     for q in questions:
-        hits = _search_all_sources(q, sources)
+        hits = _search_all_sources(q)
         if hits:
             suggestions.append(QuestionSuggestion(question=q, hits=hits))
         else:
