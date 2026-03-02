@@ -1,6 +1,18 @@
 # cordada-ceo-agents
 
-A 10-agent pipeline for CEO-level decision-making, document generation, and stakeholder communication. Built on the Anthropic Messages API with integrated tools (web search, Google Workspace, Slack).
+**An AI-powered decision pipeline for asset management CEOs.**
+
+Cordada manages private debt funds in Latin America. Every week, the CEO must synthesize information from dozens of sources — emails, Slack threads, regulatory filings, market data, internal reports — into high-stakes decisions: fund governance changes, investor communications, regulatory responses, due diligence positions.
+
+This system automates the research-to-decision workflow with 10 specialized AI agents arranged in a 3-layer pipeline. Each layer has a defined role:
+
+| Layer | Purpose | Analogy |
+|-------|---------|---------|
+| **Feed** (4 agents) | Research, extract, validate, compile | Your analyst team preparing a briefing |
+| **Interpret & Decide** (3 agents) | Audit, stress-test, present options | Your advisory board challenging the analysis |
+| **Distribute & Feedback** (2 agents) | Communicate decisions, collect reactions | Your communications team + stakeholder loop |
+
+The CEO reviews at gate checkpoints between layers. Every decision traces back through explicit models to source observations — an audit trail that satisfies both internal governance and institutional due diligence.
 
 **Core invariant:** Every decision is sustained by explicit models, and every model by traceable observations. The epistemic chain is always `OBSERVATION → MODEL → DECISION` — never decision→decision, never observation→decision.
 
@@ -151,7 +163,7 @@ The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Da
 | **Tool fallback** | Every tool has a 3-tier strategy: (1) direct API if credentials exist, (2) Claude proxy if auth fails, (3) `manual_fallback` for write operations without credentials. Agents never receive an error for missing credentials. |
 | **Feedback loop** | COLLECT_ITERATE feeds back to AUDIT, not DISCOVER. This avoids re-researching; it re-evaluates the same document with new stakeholder input. |
 | **CONTEXT middleware** | CONTEXT intercepts every agent question in interactive mode. It runs a 3-phase pipeline (PLAN → EXECUTE → SYNTHESIZE) using two lightweight Sonnet calls. Scoring is contextual: Claude adopts the canonical domain expert for the calling agent's role (e.g., auditor for VALIDATE, strategy advisor for DECIDE). Only suggestions scoring ≥ 5/10 reach the CEO. |
-| **Epistemic invariant** | `OBSERVATION → MODEL → DECISION`. Every decision is sustained by explicit models, every model by traceable observations. The EventBus validates this at every agent transition. A DECISION never rests on another DECISION or directly on OBSERVATIONS. Structurally enforced by `canonical.py` phase assignments. |
+| **Epistemic invariant** | `OBSERVATION → MODEL → DECISION`. Every decision is sustained by explicit models, every model by traceable observations. The EventBus validates this at every agent transition. A DECISION never rests on another DECISION or directly on OBSERVATIONS. Structurally enforced by `domain/invariant.py` and validated by the EventBus at every agent transition. |
 | **Canonical evaluation** | After each agent runs, its output is evaluated by Claude adopting the perspective of the canonical domain expert for that agent's role (e.g., auditor for VALIDATE, strategy advisor for DECIDE). Scored 1-10 on criteria specific to each agent. Results persist in the EventBus. |
 | **Event bus** | Every agent execution publishes an `AgentEvent` to a file-backed bus (`events_{run_id}.json`). Events include: epistemic phase, evaluation score, invariant check, input/output summaries. Enables post-mortem analysis and quality tracking across runs. |
 | **Token budget** | Context accumulation is dynamically sized to fit within model limits. Prior outputs are proportionally truncated — the most recent agent's output is always passed in full. |
@@ -184,7 +196,7 @@ Each agent is scored 1-10 on 5 criteria specific to its role. Example for **COMP
 4. **Claridad** — ¿Un lector externo puede seguir el argumento sin conocimiento previo?
 5. **Fidelidad** — ¿El modelo NO agrega interpretaciones sin sustento en observaciones?
 
-Full criteria for all agents are defined in `orchestrator/canonical.py:AGENT_CANON`.
+Full criteria for all agents are defined in `domain/registry.py:AGENTS` (the `evaluation_criteria` tuple on each `AgentDefinition`).
 
 ## Tool System
 
@@ -402,7 +414,7 @@ The codebase follows Domain-Driven Design (Evans, 2003) with clean separation be
 ```
 cordada-ceo-agents/
 │
-├── domain/                        ← BOUNDED CONTEXT: Core domain (no external deps)
+├── domain/                        ← BOUNDED CONTEXT: Core domain (zero external deps)
 │   ├── __init__.py                   Exports: AgentDefinition, EpistemicPhase, EventBus
 │   ├── model.py                     Value objects: AgentDefinition, EpistemicPhase,
 │   │                                  AgentEvaluation
@@ -412,25 +424,33 @@ cordada-ceo-agents/
 │   │                                  InvariantViolation
 │   └── invariant.py                 Epistemic chain validation (pure logic, no I/O)
 │
+├── infrastructure/                ← INFRASTRUCTURE layer: external service adapters
+│   └── tools/                       Tool executors split by bounded context:
+│       ├── __init__.py               Facade: assembles all modules, public API
+│       ├── _shared.py                Shared infra: timeout, auth detection, factories
+│       ├── proxy.py                  Claude proxy (MCP fallback for missing creds)
+│       ├── drive.py                  Google Drive: search + read (2 executors)
+│       ├── gmail.py                  Gmail: search + read + draft (3 executors)
+│       ├── slack.py                  Slack: search + read + send (3 executors)
+│       └── calendar.py              Google Calendar: read events (1 executor)
+│
 ├── agents/                        ← Domain artifacts (usable standalone in Claude.ai)
 │   ├── 01_discover.md ... 10_context.md
 │
 ├── orchestrator/                  ← APPLICATION + INTERFACE layer
 │   ├── __init__.py                   Public Python API + re-exports from domain/
 │   ├── __main__.py                   CLI entry point
-│   ├── config.py                     Infrastructure config: env vars, paths
-│   │                                  (re-exports AGENTS from domain for compat)
+│   ├── config.py                     Env vars, paths (re-exports AGENTS from domain)
 │   ├── canonical.py                  Evaluation service: Claude API calls
-│   │                                  (re-exports domain types for compat)
 │   ├── event_bus.py                  Re-export from domain.events
 │   ├── agent_runner.py               Agent execution: API calls, tool loop, metrics
-│   ├── pipeline.py                   Pipeline orchestration: sequence, gates, context
+│   ├── pipeline.py                   Pipeline orchestration: sequence, gates, events
 │   ├── gates.py                      Gate handlers: terminal_gate, auto_gate
-│   ├── tools.py                      Tool registry + executors + Claude proxy fallback
+│   ├── tools.py                      Thin facade → infrastructure/tools/ (backward compat)
 │   ├── context_middleware.py         3-phase CONTEXT: PLAN → EXECUTE → SYNTHESIZE
 │   └── project.py                    GitHub project management
 │
-├── tests/                         ← Unit tests
+├── tests/                         ← Unit tests (28 tool tests, config, pipeline, etc.)
 ├── docs/                          ← architecture.html (Material 3 interactive diagram)
 ├── examples/                      ← carta_aportantes.py
 ├── outputs/                       ← Pipeline outputs (gitignored)
@@ -443,10 +463,10 @@ cordada-ceo-agents/
 |-------|---------|------------|----------------|
 | **Domain** | `domain/` | nothing | Value objects, aggregates, invariants, events. Zero external dependencies. |
 | **Application** | `orchestrator/` | `domain/` | Use cases: run agents, orchestrate pipelines, evaluate outputs, search context. |
-| **Infrastructure** | `orchestrator/tools.py`, `config.py` | `domain/`, external APIs | Anthropic API, Google Workspace, Slack, GitHub, file I/O. |
-| **Interface** | `orchestrator/__init__.py`, `__main__.py` | `application/` | Python API, CLI. |
+| **Infrastructure** | `infrastructure/tools/` | `domain/`, external SDKs | Google Workspace API, Slack SDK, Anthropic proxy, auth/timeout/caching. |
+| **Interface** | `orchestrator/__init__.py`, `__main__.py` | application | Python API, CLI. Thin re-export facades. |
 
-Dependencies flow **inward**: interface → application → domain. The domain layer never imports from orchestrator.
+Dependencies flow **inward**: interface → application → domain. Infrastructure adapters are injected at the application boundary. The domain layer never imports from orchestrator or infrastructure.
 
 ### Unified agent definition (single source of truth)
 
@@ -454,7 +474,9 @@ Previously, agent identity was split across two registries that could drift:
 - `config.AGENTS` — pipeline config (order, layer, file, next)
 - `canonical.AGENT_CANON` — epistemic definitions (phase, criteria, referent)
 
-Now there is ONE `AgentDefinition` per agent in `domain.registry.AGENTS`:
+Both have been unified into `domain.registry.AGENTS`:
+
+Now there is ONE `AgentDefinition` per agent:
 
 ```python
 from domain import AGENTS
