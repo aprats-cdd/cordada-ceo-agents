@@ -37,6 +37,8 @@ from .pipeline import run_pipeline as _run_pipeline, resume_pipeline as _resume_
 from .gates import DEFAULT_GATES, GateHandler, terminal_gate, auto_gate
 from .tools import call_claude_as_proxy
 from .config import AGENTS
+from .canonical import AGENT_CANON, EpistemicPhase, AgentEvaluation
+from .event_bus import EventBus
 
 
 def agent(name: str, user_input: str, *, verbose: bool = False) -> str:
@@ -221,4 +223,8 @@ __all__ = [
     "DEFAULT_GATES",
     "auto_gate",
     "terminal_gate",
+    "AGENT_CANON",
+    "EpistemicPhase",
+    "AgentEvaluation",
+    "EventBus",
 ]
