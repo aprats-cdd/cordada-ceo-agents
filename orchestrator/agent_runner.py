@@ -390,6 +390,7 @@ def _run_interactive(
         if message.stop_reason == "end_turn":
             user_reply = _prompt_with_context(
                 assistant_text,
+                agent_name=agent_name,
                 use_context=use_context,
             )
             if user_reply is None:  # user typed 'done'
@@ -409,6 +410,7 @@ def _run_interactive(
 def _prompt_with_context(
     assistant_text: str,
     *,
+    agent_name: str,
     use_context: bool,
 ) -> str | None:
     """Prompt the user, optionally showing CONTEXT suggestions first.
@@ -424,7 +426,7 @@ def _prompt_with_context(
             compile_confirmed_answers,
         )
 
-        result = suggest_answers(assistant_text)
+        result = suggest_answers(assistant_text, agent_name=agent_name)
         if result:
             print(format_suggestions(result))
             choice = input("\n  Tu eleccion (1/2/3): ").strip()
