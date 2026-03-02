@@ -1,11 +1,24 @@
 """
 Configuration for cordada-ceo-agents.
-Loads environment variables and defines defaults.
+
+Infrastructure concern: loads environment variables and resolves paths.
+Agent definitions live in ``domain.registry`` — this module re-exports
+them for backward compatibility.
 """
 
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+
+# Re-export from domain (single source of truth)
+from domain.registry import (
+    AGENTS,
+    PIPELINE_ORDER,
+    get_model_for_agent as get_model,
+    MODEL_DEFAULT,
+    MODEL_PREMIUM,
+    PREMIUM_AGENTS,
+)
 
 # Load .env file
 load_dotenv()
@@ -23,36 +36,14 @@ if not ANTHROPIC_API_KEY:
 GITHUB_ORG = os.getenv("GITHUB_ORG", "cordada")
 
 # --- Google Workspace Integration ---
-# Path to a Google service account JSON credentials file.
-# Required for: search_google_drive, read_google_drive_document,
-#               search_gmail, read_gmail_message, draft_gmail, read_calendar
-# Set up: https://cloud.google.com/iam/docs/service-accounts-create
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
-# If using domain-wide delegation, the email to impersonate
 GOOGLE_DELEGATE_EMAIL = os.getenv("GOOGLE_DELEGATE_EMAIL")
 
 # --- Slack Integration ---
-# Slack Bot OAuth Token (xoxb-...).
-# Required for: search_slack, read_slack_thread, send_slack_message
-# Set up: https://api.slack.com/apps → OAuth & Permissions
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 # --- CONTEXT Middleware ---
-# The CONTEXT middleware intercepts agent questions in interactive mode
-# and searches internal sources (Drive, Gmail, Slack) for suggested
-# answers.  Uses the same tool executors as agents — always works via
-# proxy even without direct API credentials.
-# Set to false to disable globally; or use --no-context at runtime.
 CONTEXT_ENABLED = os.getenv("CONTEXT_ENABLED", "true").lower() in ("true", "1", "yes")
-
-# --- Model Selection ---
-# claude-sonnet-4-20250514: Best balance of quality and cost for most agents
-# claude-opus-4-6: Use for AUDIT, REFLECT, DECIDE where quality matters most
-MODEL_DEFAULT = "claude-sonnet-4-20250514"
-MODEL_PREMIUM = "claude-opus-4-6"
-
-# Which agents use premium model
-PREMIUM_AGENTS = {"audit", "reflect", "decide"}
 
 # --- Paths ---
 ROOT_DIR = Path(__file__).parent.parent
@@ -61,88 +52,6 @@ OUTPUTS_DIR = ROOT_DIR / "outputs"
 OUTPUTS_DIR.mkdir(exist_ok=True)
 PROJECTS_DIR = Path(os.getenv("PROJECTS_DIR", ROOT_DIR / "projects"))
 PROJECTS_DIR.mkdir(exist_ok=True)
-
-# --- Agent Registry ---
-# Maps agent names to their prompt files and pipeline order
-AGENTS = {
-    "discover": {
-        "file": "01_discover.md",
-        "order": 1,
-        "layer": "feed",
-        "description": "Research and rank sources",
-        "next": "extract",
-    },
-    "extract": {
-        "file": "02_extract.md",
-        "order": 2,
-        "layer": "feed",
-        "description": "Pull key data from sources",
-        "next": "validate",
-    },
-    "validate": {
-        "file": "03_validate.md",
-        "order": 3,
-        "layer": "feed",
-        "description": "Verify accuracy and consistency",
-        "next": "compile",
-    },
-    "compile": {
-        "file": "04_compile.md",
-        "order": 4,
-        "layer": "feed",
-        "description": "Generate structured document",
-        "next": "audit",
-    },
-    "audit": {
-        "file": "05_audit.md",
-        "order": 5,
-        "layer": "interpret",
-        "description": "Multi-expert panel review",
-        "next": "reflect",
-    },
-    "reflect": {
-        "file": "06_reflect.md",
-        "order": 6,
-        "layer": "decide",
-        "description": "Strategic stress-test",
-        "next": "decide",
-    },
-    "decide": {
-        "file": "07_decide.md",
-        "order": 7,
-        "layer": "decide",
-        "description": "Present options with trade-offs",
-        "next": "distribute",
-    },
-    "distribute": {
-        "file": "08_distribute.md",
-        "order": 8,
-        "layer": "distribute",
-        "description": "Adapt deliverable to channel",
-        "next": "collect_iterate",
-    },
-    "collect_iterate": {
-        "file": "09_collect_iterate.md",
-        "order": 9,
-        "layer": "feedback",
-        "description": "Parse feedback and re-inject",
-        "next": "audit",  # Loop back
-    },
-    "context": {
-        "file": "10_context.md",
-        "order": 10,
-        "layer": "support",
-        "description": "Search internal sources to suggest answers",
-        "next": None,
-    },
-}
-
-
-def get_model(agent_name: str) -> str:
-    """Return the appropriate model for an agent."""
-    if agent_name in PREMIUM_AGENTS:
-        return MODEL_PREMIUM
-    return MODEL_DEFAULT
 
 
 def get_agent_prompt(agent_name: str) -> str:
