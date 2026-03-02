@@ -27,10 +27,12 @@ from pathlib import Path
 from domain.registry import AGENTS, get_model_for_agent as get_model
 from domain.model import CostBudget
 from domain.events import EventBus
+from domain.evaluation import evaluate_structural
 
 from .config import OUTPUTS_DIR, COST_BUDGET_MAX_USD, COST_MAX_OUTPUT_TOKENS, COST_MAX_ITERATIONS
 from .agent_runner import run_agent, last_metrics
 from .canonical import evaluate_output
+from .contract_parser import try_parse, get_schema_instruction, get_retry_prompt
 from .gates import (
     GateContext,
     GateResult,
@@ -437,16 +439,54 @@ def _run_pipeline_loop(
 
         # Run agent
         is_interactive = agent_name in interactive_at
+
+        # Inject schema instruction into pipeline context for contract agents
+        schema_instruction = get_schema_instruction(agent_name)
+        agent_input = pipeline_context
+        if schema_instruction and not is_interactive:
+            agent_input = pipeline_context + schema_instruction
         output_path = run_dir / f"{step:02d}_{agent_name}.md"
 
         response = run_agent(
             agent_name=agent_name,
-            user_input=pipeline_context,
+            user_input=agent_input,
             output_path=output_path,
             interactive=is_interactive,
             no_context=no_context,
             max_output_tokens=budget.max_agent_output_tokens if budget else None,
         )
+
+        # Contract parsing: try to parse output to structured schema
+        structured_output = None
+        parse_result = try_parse(agent_name, response)
+
+        if not parse_result.success and parse_result.errors:
+            # Retry once with error feedback
+            print(f"  Contract parse failed for {agent_name.upper()}: {parse_result.errors}")
+            print(f"  Retrying with schema correction prompt...")
+
+            retry_prompt = get_retry_prompt(agent_name, parse_result.errors)
+            retry_input = f"{response}\n\n---\n\n{retry_prompt}"
+
+            response = run_agent(
+                agent_name=agent_name,
+                user_input=retry_input,
+                output_path=output_path,
+                interactive=False,
+                save=False,
+                verbose=False,
+                max_output_tokens=budget.max_agent_output_tokens if budget else None,
+            )
+
+            parse_result = try_parse(agent_name, response)
+            if parse_result.success:
+                print(f"  Contract retry succeeded for {agent_name.upper()}")
+            else:
+                print(f"  Contract retry failed for {agent_name.upper()}: {parse_result.errors}")
+                print(f"  Continuing with raw output.")
+
+        if parse_result.success and parse_result.structured:
+            structured_output = parse_result.structured
 
         outputs[agent_name] = response
         current_input = response
@@ -454,17 +494,27 @@ def _run_pipeline_loop(
         # Retrieve token_usage from the agent run (via last_metrics)
         agent_token_usage = last_metrics.token_usage if last_metrics else None
 
-        # Canonical evaluation + event bus
+        # Tier 1 structural evaluation (no LLM call) + Tier 2 heuristic
         if bus:
             eval_result = None
+
+            # Tier 1: structural checks (free, deterministic)
+            structural = evaluate_structural(agent_name, structured_output)
+            if structural.checks:
+                print(f"  {structural.summary()}")
+
             if evaluate:
                 canon = AGENTS.get(agent_name)
                 if canon:
-                    print(f"  Evaluating {agent_name.upper()} "
-                          f"[{canon.phase.value}] as {canon.canonical_referent[:50]}...")
-                    eval_result = evaluate_output(agent_name, response)
-                    if eval_result:
-                        print(f"  Score: {eval_result.score}/10 — {eval_result.reasoning}")
+                    if structural.passed:
+                        # Tier 2: heuristic evaluation (Sonnet API call)
+                        print(f"  Evaluating {agent_name.upper()} "
+                              f"[{canon.phase.value}] as {canon.canonical_referent[:50]}...")
+                        eval_result = evaluate_output(agent_name, response)
+                        if eval_result:
+                            print(f"  Score: {eval_result.score}/10 — {eval_result.reasoning}")
+                    else:
+                        print(f"  Tier 1 failed ({structural.score:.0%}) — skipping Tier 2 (saves API call)")
 
             bus.publish(
                 agent_name=agent_name,
@@ -472,6 +522,7 @@ def _run_pipeline_loop(
                 evaluation=eval_result,
                 input_text=pipeline_context,
                 token_usage=agent_token_usage,
+                structured_output=structured_output,
             )
 
         # Project mode: commit each agent output
