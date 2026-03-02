@@ -42,6 +42,8 @@ class AgentEvent:
     upstream_event_id: str | None = None
     invariant_valid: bool = True
     invariant_note: str = ""
+    # Contract fields
+    agent_output_structured: dict | None = None  # parsed contract (JSON dict)
     # Cost governance fields
     token_usage: dict | None = None       # serialized TokenUsage (asdict)
     cumulative_cost_usd: float = 0.0
@@ -78,6 +80,7 @@ class EventBus:
         evaluation: AgentEvaluation | None = None,
         input_text: str = "",
         token_usage: TokenUsage | None = None,
+        structured_output: dict | None = None,
     ) -> AgentEvent:
         """Record an agent execution event."""
         agent = AGENTS.get(agent_name)
@@ -109,6 +112,7 @@ class EventBus:
             upstream_event_id=upstream_event.event_id if upstream_event else None,
             invariant_valid=valid,
             invariant_note=note,
+            agent_output_structured=structured_output,
             token_usage=asdict(token_usage) if token_usage else None,
             cumulative_cost_usd=cumulative,
         )
