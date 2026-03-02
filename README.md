@@ -80,14 +80,25 @@ The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Da
 ═══════════════════════════════════════════════════════════════════════════
 
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  SUPPORT — CONTEXT                             callable independently  │
-│                                                model: Sonnet           │
+│  SUPPORT — CONTEXT MIDDLEWARE                 intercepts all agents     │
+│                                               model: 2× Sonnet calls   │
 │                                                                        │
-│  ┌──────────┐                                                          │
-│  │ CONTEXT  │  Searches internal sources to answer ad-hoc questions.   │
-│  │          │  Not part of the pipeline. Called via context() or CLI.   │
-│  └──────────┘                                                          │
-│   drive_search, gmail_search, slack_search, calendar_read              │
+│  When any agent asks a question in interactive mode:                    │
+│                                                                        │
+│  ┌─────────┐    ┌─────────┐    ┌─────────────┐                        │
+│  │  PLAN   │───▶│ EXECUTE │───▶│ SYNTHESIZE  │                        │
+│  │         │    │         │    │             │                        │
+│  │ Claude  │    │ Run     │    │ Claude      │                        │
+│  │ reads   │    │ planned │    │ interprets  │                        │
+│  │ agent   │    │ queries │    │ results +   │                        │
+│  │ output, │    │ via     │    │ scores 1-10 │                        │
+│  │ designs │    │ tools   │    │ as domain   │                        │
+│  │ search  │    │         │    │ expert for  │                        │
+│  │ queries │    │         │    │ the calling │                        │
+│  │         │    │         │    │ agent's rol │                        │
+│  └─────────┘    └─────────┘    └─────────────┘                        │
+│   Sonnet call    drive,gmail    Sonnet call                            │
+│                  slack,calendar  score >= 5 → show to CEO              │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -100,7 +111,7 @@ The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Da
 | **Gate semantics** | Gates are *blocking checkpoints*. The pipeline pauses and persists state. The CEO can resume hours or days later. Three actions: `proceed`, `modify` (inject context), `stop` (save + exit). |
 | **Tool fallback** | Every tool has a 3-tier strategy: (1) direct API if credentials exist, (2) Claude proxy if auth fails, (3) `manual_fallback` for write operations without credentials. Agents never receive an error for missing credentials. |
 | **Feedback loop** | COLLECT_ITERATE feeds back to AUDIT, not DISCOVER. This avoids re-researching; it re-evaluates the same document with new stakeholder input. |
-| **CONTEXT isolation** | CONTEXT is orthogonal to the pipeline. It has no `next` agent, no gate, and no pipeline state. It's a stateless query service. |
+| **CONTEXT middleware** | CONTEXT intercepts every agent question in interactive mode. It runs a 3-phase pipeline (PLAN → EXECUTE → SYNTHESIZE) using two lightweight Sonnet calls. Scoring is contextual: Claude adopts the canonical domain expert for the calling agent's role (e.g., auditor for VALIDATE, strategy advisor for DECIDE). Only suggestions scoring ≥ 5/10 reach the CEO. |
 | **Token budget** | Context accumulation is dynamically sized to fit within model limits. Prior outputs are proportionally truncated — the most recent agent's output is always passed in full. |
 | **Graceful shutdown** | Ctrl+C during a pipeline run saves state to manifest and commits to GitHub. The pipeline can be resumed exactly where it stopped. |
 
@@ -117,7 +128,7 @@ The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Da
 | 07 | **DECIDE** | Decide | — | Present 2-3 options with trade-offs for CEO decision |
 | 08 | **DISTRIBUTE** | Distribute | slack, gmail | Adapt deliverable to channel (WhatsApp, Slack, email) |
 | 09 | **COLLECT+ITERATE** | Feedback | slack, gmail | Parse stakeholder feedback, re-inject into pipeline |
-| 10 | **CONTEXT** | Support | drive, gmail, slack, calendar | Search internal sources to suggest answers |
+| 10 | **CONTEXT** | Support | drive, gmail, slack, calendar | 3-phase middleware: PLAN → EXECUTE → SYNTHESIZE with 1-10 scoring |
 
 ## Tool System
 
@@ -147,6 +158,73 @@ Credentials available?
 | `read_slack_thread` | Custom | EXTRACT, COLLECT_ITERATE |
 | `send_slack_message` | Custom | DISTRIBUTE |
 | `read_calendar` | Custom | CONTEXT |
+
+## CONTEXT Middleware Architecture
+
+CONTEXT is a 3-phase middleware that intercepts every agent question in interactive mode. Instead of showing raw search results, it uses Claude to interpret what's needed, design searches, and evaluate results with domain-appropriate rigor.
+
+```
+Agent asks question in interactive mode
+        │
+        ▼
+┌── PHASE 1: PLAN ──────────────────────────────────────────────────┐
+│  Claude Sonnet reads the agent's output + knows which agent is    │
+│  asking. Extracts the actual information needs (not regex).       │
+│  Designs targeted queries per source:                             │
+│                                                                   │
+│  DISCOVER asks about AUM →                                        │
+│    Drive: "reporte mensual AUM patrimonio"                        │
+│    Gmail: "from:ceo@cordada.cl AUM"                               │
+│                                                                   │
+│  DECIDE asks about stakeholders →                                 │
+│    Slack: "#directorio gobernanza reestructuración"               │
+│    Gmail: "Fernando reestructuración propuesta"                   │
+│                                                                   │
+│  Output: JSON search plan with tool + params per question         │
+└───────────────────────────────┬───────────────────────────────────┘
+                                │
+                                ▼
+┌── PHASE 2: EXECUTE ───────────────────────────────────────────────┐
+│  Runs each planned query via tools.execute_tool()                 │
+│  (direct API → proxy fallback, same as agents)                    │
+│  Sources: Drive, Gmail, Slack, Calendar                           │
+└───────────────────────────────┬───────────────────────────────────┘
+                                │
+                                ▼
+┌── PHASE 3: SYNTHESIZE ────────────────────────────────────────────┐
+│  Claude Sonnet interprets raw results adopting the perspective    │
+│  of the canonical domain expert for the calling agent's role:     │
+│                                                                   │
+│  Agent        │ Canonical referent                                │
+│  ─────────────┼─────────────────────────────────────────────      │
+│  DISCOVER     │ Analista senior de research                       │
+│  EXTRACT      │ Data analyst financiero                           │
+│  VALIDATE     │ Auditor / fact-checker independiente              │
+│  COMPILE      │ Consultor estratégico senior                      │
+│  AUDIT        │ Panel multi-experto (legal, financiero, reg.)     │
+│  REFLECT      │ Devil's advocate estratégico                      │
+│  DECIDE       │ Strategy advisor de C-suite                       │
+│  DISTRIBUTE   │ Director de comunicaciones corporativas           │
+│  COLLECT_ITER │ Product manager senior                            │
+│                                                                   │
+│  Scores each suggestion 1-10 on 4 criteria:                       │
+│    Relevancia · Frescura · Autoridad · Suficiencia                │
+│                                                                   │
+│  Score >= 5 → show to CEO with reasoning                          │
+│  Score < 5  → report as "no encontré respuesta suficiente"        │
+└───────────────────────────────┬───────────────────────────────────┘
+                                │
+                                ▼
+         CEO sees:
+           **¿Cuál es el AUM actual?** [8/10]
+           → USD 200M al cierre de diciembre 2024
+             Fuente: Drive - Reporte Mensual Dic 2024.xlsx
+             Evaluación: Dato de fuente oficial, reciente, específico.
+
+           Opciones: 1. Confirmar  2. Corregir  3. Manual
+```
+
+**Cost:** 2 lightweight Sonnet calls (~3K tokens total) per interactive turn. The quality gain — contextual queries, intelligent interpretation, domain-expert scoring — is substantial compared to the previous regex + keyword approach.
 
 ## Gate System
 
@@ -286,6 +364,7 @@ cordada-ceo-agents/
 │   ├── pipeline.py           ← Chain agents with gate-based pause/resume
 │   ├── gates.py              ← Gate handlers (terminal, auto)
 │   ├── tools.py              ← Tool definitions, executors, Claude proxy fallback
+│   ├── context_middleware.py ← 3-phase CONTEXT: PLAN → EXECUTE → SYNTHESIZE
 │   └── project.py            ← GitHub repo creation + traceability
 ├── outputs/                  ← Pipeline outputs (gitignored)
 ├── projects/                 ← Project repos (gitignored)
@@ -302,6 +381,7 @@ cordada-ceo-agents/
 |-------|-------|--------|
 | DISCOVER → DISTRIBUTE | claude-sonnet-4-20250514 | Best balance of quality and cost |
 | AUDIT, REFLECT, DECIDE | claude-opus-4-6 | Strategic evaluation requires maximum quality |
+| CONTEXT middleware (2 calls) | claude-sonnet-4-20250514 | PLAN + SYNTHESIZE phases, ~3K tokens per turn |
 | Claude proxy fallback | claude-sonnet-4-20250514 | Data retrieval proxy |
 
 ## Design Patterns
@@ -315,6 +395,7 @@ cordada-ceo-agents/
 | Reflection | REFLECT | Gullí (2025) Ch. 4 |
 | Human-in-the-Loop | Gates at AUDIT → COLLECT_ITERATE | Gullí (2025) Ch. 13 |
 | Guardrails | VALIDATE | Gullí (2025) Ch. 12 |
+| Canonical Evaluation | CONTEXT scores by domain expert | — |
 | Graceful Degradation | Tool fallback via Claude proxy | — |
 
 ## References
