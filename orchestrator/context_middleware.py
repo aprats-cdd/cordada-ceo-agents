@@ -1,27 +1,83 @@
 """
 CONTEXT Middleware — intercept agent questions in interactive mode,
-search internal sources (Drive, Gmail, Slack), and suggest answers.
+search internal sources (Drive, Gmail, Slack, Calendar), and suggest
+answers scored by a domain-appropriate canonical referent.
 
-Uses the same tool executors from ``tools.py`` so the proxy fallback
-(Claude with MCP) is always available — even without direct API
-credentials configured.
+Three-phase flow:
 
-Flow:
-    1. Agent produces a response containing questions for the user.
-    2. ``suggest_answers()`` extracts the questions, searches all
-       sources via the existing tool executors, and returns a
-       formatted suggestion block.
-    3. The user confirms, corrects, or answers manually.
-    4. ``compile_confirmed_answers()`` turns the confirmed suggestions
-       into a plain-text reply for the agent.
+    1. **PLAN** — Claude reads the agent's output, extracts what
+       information is needed, and designs targeted search queries
+       per source (Drive/Gmail/Slack/Calendar).
+
+    2. **EXECUTE** — Runs the planned queries via ``tools.execute_tool()``
+       (direct API with proxy fallback).
+
+    3. **SYNTHESIZE** — Claude interprets raw results, synthesises
+       answers, and scores each 1–10 adopting the perspective of the
+       canonical domain expert for the calling agent's role.
+       Only suggestions scoring >= 5 are shown to the CEO.
 """
+
+from __future__ import annotations
 
 import json
 import logging
-import re
+import threading
 from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Model used for CONTEXT calls (lightweight, fast)
+_CONTEXT_MODEL = "claude-sonnet-4-20250514"
+
+# ---------------------------------------------------------------------------
+# Canonical domain experts per agent
+# ---------------------------------------------------------------------------
+
+AGENT_DOMAINS: dict[str, str] = {
+    "discover": (
+        "un analista senior de research en asset management. "
+        "Prioriza fuentes primarias, datos verificables y recencia."
+    ),
+    "extract": (
+        "un data analyst financiero. "
+        "Prioriza exactitud numérica, consistencia y trazabilidad del dato."
+    ),
+    "validate": (
+        "un auditor / fact-checker independiente. "
+        "Prioriza corroboración cruzada, ausencia de sesgo y fuentes oficiales."
+    ),
+    "compile": (
+        "un consultor estratégico senior (McKinsey/BCG). "
+        "Prioriza claridad, relevancia para el destinatario y solidez argumentativa."
+    ),
+    "audit": (
+        "un panel multi-experto (legal, financiero, regulatorio). "
+        "Prioriza rigor, completitud y señalamiento de riesgos."
+    ),
+    "reflect": (
+        "un devil's advocate estratégico. "
+        "Prioriza evidencia contraria, supuestos no validados y riesgos ocultos."
+    ),
+    "decide": (
+        "un strategy advisor de C-suite. "
+        "Prioriza impacto en stakeholders, viabilidad y reversibilidad."
+    ),
+    "distribute": (
+        "un director de comunicaciones corporativas. "
+        "Prioriza tono, canal adecuado, timing y sensibilidad del destinatario."
+    ),
+    "collect_iterate": (
+        "un product manager senior. "
+        "Prioriza señal vs ruido en feedback, patrones y accionabilidad."
+    ),
+}
+
+_DEFAULT_DOMAIN = (
+    "un profesional senior del dominio relevante. "
+    "Prioriza relevancia, recencia y autoridad de la fuente."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -29,246 +85,355 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SourceHit:
-    """A single search result from an internal source."""
-    answer: str
-    source_type: str        # "Drive", "Gmail", "Slack"
-    source_name: str        # document title, email subject, channel name…
-    date: str               # ISO date or human-readable
-    confidence: str         # "Alta", "Media", "Baja"
-
-
-@dataclass
-class QuestionSuggestion:
-    """Suggestions found for one question."""
+class Suggestion:
+    """A scored suggestion for one question."""
     question: str
-    hits: list[SourceHit] = field(default_factory=list)
+    answer: str
+    source_type: str     # "Drive", "Gmail", "Slack", "Calendar"
+    source_name: str
+    date: str
+    score: int           # 1-10
+    reasoning: str
 
 
 @dataclass
 class ContextResult:
     """Full result of a CONTEXT middleware pass."""
-    suggestions: list[QuestionSuggestion] = field(default_factory=list)
+    suggestions: list[Suggestion] = field(default_factory=list)
     unanswered: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
-# Question extraction
+# Shared Anthropic client (lazy singleton, same pattern as tools.py)
 # ---------------------------------------------------------------------------
 
-_QUESTION_RE = re.compile(
-    r"""
-    (?:                          # optional leading numbering / bullet
-        ^\s*(?:\d+[.)]\s*|[-*]\s*)
-    )?
-    (.+?\?)                      # capture up to the question mark
-    """,
-    re.MULTILINE | re.VERBOSE,
-)
+_context_client: Any = None
+_context_client_lock = threading.Lock()
 
 
-def extract_questions(text: str) -> list[str]:
-    """Extract question-like sentences from agent output.
-
-    Heuristic — intentionally over-extracts (better to suggest too
-    much than too little).
-    """
-    questions: list[str] = []
-    seen: set[str] = set()
-    for m in _QUESTION_RE.finditer(text):
-        q = m.group(1).strip()
-        # Skip very short or duplicate questions
-        if len(q) < 10 or q.lower() in seen:
-            continue
-        seen.add(q.lower())
-        questions.append(q)
-    return questions
+def _get_client() -> Any:
+    global _context_client
+    if _context_client is None:
+        with _context_client_lock:
+            if _context_client is None:
+                import anthropic
+                from .config import ANTHROPIC_API_KEY
+                _context_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _context_client
 
 
-# ---------------------------------------------------------------------------
-# Source search helpers — delegate to tools.py executors
-# ---------------------------------------------------------------------------
-
-def _keywords_from_question(question: str) -> str:
-    """Extract keywords from a question for API search queries.
-
-    Strips common Spanish interrogative words and short noise words.
-    """
-    stopwords = {
-        "cuál", "cual", "cuáles", "cuales", "qué", "que", "quién",
-        "quien", "quiénes", "quienes", "cómo", "como", "dónde",
-        "donde", "cuándo", "cuando", "cuánto", "cuanto", "cuántos",
-        "cuantos", "por", "para", "del", "los", "las", "una", "uno",
-        "unos", "unas", "con", "sin", "sobre", "entre", "pero",
-        "hay", "tiene", "son", "está", "están", "ser", "fue",
-        "desde", "hasta", "más", "menos", "este", "esta", "estos",
-        "estas", "ese", "esa", "esos", "esas", "aquel", "aquella",
-        "el", "la", "de", "en", "es", "al", "lo", "se", "su",
-        "nos", "les", "te", "me", "le", "ya", "si", "no",
-    }
-    tokens = re.findall(r"\w+", question.lower())
-    keywords = [t for t in tokens if t not in stopwords and len(t) > 2]
-    return " ".join(keywords)
+def _call_claude(system: str, user_message: str) -> str:
+    """Make a lightweight Claude call and return the text response."""
+    client = _get_client()
+    message = client.messages.create(
+        model=_CONTEXT_MODEL,
+        max_tokens=4096,
+        system=system,
+        messages=[{"role": "user", "content": user_message}],
+    )
+    blocks = [b.text for b in message.content if hasattr(b, "text")]
+    return "\n".join(blocks) if blocks else ""
 
 
-def _parse_tool_result(raw: str) -> dict:
-    """Parse a JSON tool result string, returning {} on failure."""
+def _parse_json_response(text: str) -> dict:
+    """Extract JSON from Claude's response, handling code fences."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        first_nl = cleaned.index("\n")
+        cleaned = cleaned[first_nl + 1:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
     try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Failed to parse CONTEXT JSON response: %s", cleaned[:200])
         return {}
 
 
-def _search_drive(query: str) -> list[SourceHit]:
-    """Search Google Drive via tools.py executor (with proxy fallback)."""
+# ---------------------------------------------------------------------------
+# Phase 1: PLAN — Claude interprets questions + designs search strategy
+# ---------------------------------------------------------------------------
+
+_PLAN_SYSTEM = (
+    "Eres CONTEXT, el middleware de recuperación de conocimiento interno de Cordada, "
+    "un asset manager chileno de deuda privada LatAm. "
+    "Tu trabajo es analizar el texto de un agente, extraer qué información necesita, "
+    "y diseñar queries de búsqueda precisas para cada fuente interna."
+)
+
+_PLAN_USER_TEMPLATE = """\
+AGENTE: {agent_name} — {agent_description}
+
+TEXTO DEL AGENTE:
+---
+{assistant_text}
+---
+
+TAREA: Analiza el texto y extrae las preguntas o campos de información que el \
+agente necesita del CEO. Para cada uno, diseña queries de búsqueda específicas.
+
+Guía de queries por fuente:
+- search_google_drive: documentos formales (reportes, actas, memos, presentaciones). \
+  Usa términos como "AUM", "reporte mensual", "acta directorio", "due diligence".
+- search_gmail: emails recientes (últimos 6 meses). Del CEO primero. \
+  Usa "from:ceo@cordada.cl" o temas específicos.
+- search_slack: conversaciones informales del equipo. \
+  Canales típicos: inversiones, pipeline, deals, operaciones, nav, legal, directorio, compliance.
+- read_calendar: solo si la pregunta involucra timing, deadlines o reuniones.
+
+Para cada pregunta, incluye solo las fuentes que tengan sentido (no todas siempre).
+
+Responde SOLO con JSON válido (sin explicaciones):
+{{
+  "questions": [
+    {{
+      "question": "texto de la pregunta",
+      "category": "financiero|legal|operacional|estratégico|comunicación|gobernanza",
+      "searches": [
+        {{"tool": "search_google_drive", "params": {{"query": "...", "max_results": 5}}}},
+        {{"tool": "search_gmail", "params": {{"query": "...", "max_results": 5}}}}
+      ]
+    }}
+  ]
+}}
+
+Si el texto NO contiene preguntas que requieran información interna, responde:
+{{"questions": []}}
+"""
+
+
+def _plan_searches(
+    agent_name: str,
+    agent_description: str,
+    assistant_text: str,
+) -> list[dict]:
+    """Phase 1: Use Claude to interpret questions and design search queries."""
+    user_msg = _PLAN_USER_TEMPLATE.format(
+        agent_name=agent_name.upper(),
+        agent_description=agent_description,
+        assistant_text=assistant_text,
+    )
+    try:
+        raw = _call_claude(_PLAN_SYSTEM, user_msg)
+        data = _parse_json_response(raw)
+        return data.get("questions", [])
+    except Exception:
+        logger.exception("CONTEXT PLAN phase failed")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: EXECUTE — Run planned searches via tools.py
+# ---------------------------------------------------------------------------
+
+def _execute_searches(planned_questions: list[dict]) -> dict[str, list[dict]]:
+    """Phase 2: Execute all planned searches, grouped by question."""
     from .tools import execute_tool
 
-    raw = execute_tool("search_google_drive", {"query": query, "max_results": 5})
-    data = _parse_tool_result(raw)
+    results: dict[str, list[dict]] = {}
 
-    if "error" in data:
-        logger.warning("Drive search error: %s", data["error"])
-        return []
+    for pq in planned_questions:
+        question = pq.get("question", "")
+        question_results: list[dict] = []
 
-    hits: list[SourceHit] = []
-    for doc in data.get("results", []):
-        hits.append(SourceHit(
-            answer=doc.get("name", ""),
-            source_type="Drive",
-            source_name=doc.get("name", ""),
-            date=doc.get("modified", "")[:10],
-            confidence="Media",
+        for search in pq.get("searches", []):
+            tool_name = search.get("tool", "")
+            params = search.get("params", {})
+
+            try:
+                raw = execute_tool(tool_name, params)
+                data = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception as e:
+                logger.warning("Search failed (%s): %s", tool_name, e)
+                data = {"error": str(e)}
+
+            question_results.append({
+                "source": tool_name,
+                "params": params,
+                "result": data,
+            })
+
+        results[question] = question_results
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: SYNTHESIZE — Claude interprets results + scores as domain expert
+# ---------------------------------------------------------------------------
+
+_SYNTH_SYSTEM = (
+    "Eres CONTEXT, el middleware de evaluación de Cordada. "
+    "Tu trabajo es interpretar resultados de búsqueda, sintetizar respuestas, "
+    "y puntuar la calidad de cada sugerencia con rigor profesional."
+)
+
+_SYNTH_USER_TEMPLATE = """\
+AGENTE: {agent_name} — {agent_description}
+
+PREGUNTAS Y RESULTADOS DE BÚSQUEDA:
+{search_results_json}
+
+TAREA: Para cada pregunta, interpreta los resultados y genera una sugerencia.
+
+CRITERIO DE EVALUACIÓN — Adopta la perspectiva de {domain_expert}
+
+Puntúa cada sugerencia de 1 a 10:
+- Relevancia: ¿responde directamente la pregunta?
+- Frescura: ¿la fuente es reciente y vigente?
+- Autoridad: ¿la fuente es confiable para este tipo de dato?
+- Suficiencia: ¿la información es completa o parcial?
+
+El puntaje final es el promedio redondeado de estos 4 criterios.
+Solo incluye en "suggestions" las respuestas con puntaje >= 5.
+Las de puntaje < 5 van a "unanswered" (con breve razón).
+
+IMPORTANTE:
+- Sintetiza la respuesta (no copies el snippet raw).
+- Parafrasea emails, no los cites textualmente.
+- Incluye la fecha de la fuente para evaluar vigencia.
+- Si múltiples fuentes coinciden, menciona las más autoritativas.
+
+Responde SOLO con JSON válido:
+{{
+  "suggestions": [
+    {{
+      "question": "...",
+      "answer": "respuesta sintetizada",
+      "source_type": "Drive|Gmail|Slack|Calendar",
+      "source_name": "nombre del documento o mensaje",
+      "date": "fecha de la fuente",
+      "score": 8,
+      "reasoning": "breve justificación del puntaje (1 línea)"
+    }}
+  ],
+  "unanswered": [
+    {{
+      "question": "...",
+      "reason": "por qué no se encontró respuesta suficiente"
+    }}
+  ]
+}}
+"""
+
+
+def _synthesize(
+    agent_name: str,
+    agent_description: str,
+    search_results: dict[str, list[dict]],
+) -> ContextResult:
+    """Phase 3: Claude interprets results and scores suggestions."""
+    domain_expert = AGENT_DOMAINS.get(agent_name, _DEFAULT_DOMAIN)
+
+    # Build compact representation for Claude (skip errors, keep data)
+    compact: list[dict] = []
+    for question, results in search_results.items():
+        sources: list[dict] = []
+        for r in results:
+            result_data = r.get("result", {})
+            if "error" not in result_data:
+                sources.append({
+                    "tool": r["source"],
+                    "data": result_data,
+                })
+        compact.append({"question": question, "sources": sources})
+
+    user_msg = _SYNTH_USER_TEMPLATE.format(
+        agent_name=agent_name.upper(),
+        agent_description=agent_description,
+        search_results_json=json.dumps(compact, ensure_ascii=False, indent=2),
+        domain_expert=domain_expert,
+    )
+
+    try:
+        raw = _call_claude(_SYNTH_SYSTEM, user_msg)
+        data = _parse_json_response(raw)
+    except Exception:
+        logger.exception("CONTEXT SYNTHESIZE phase failed")
+        return ContextResult()
+
+    suggestions: list[Suggestion] = []
+    for s in data.get("suggestions", []):
+        score = s.get("score", 0)
+        if score < 5:
+            continue
+        suggestions.append(Suggestion(
+            question=s.get("question", ""),
+            answer=s.get("answer", ""),
+            source_type=s.get("source_type", ""),
+            source_name=s.get("source_name", ""),
+            date=s.get("date", ""),
+            score=score,
+            reasoning=s.get("reasoning", ""),
         ))
-    return hits
 
+    unanswered: list[str] = []
+    for u in data.get("unanswered", []):
+        if isinstance(u, dict):
+            q = u.get("question", "")
+            reason = u.get("reason", "")
+            unanswered.append(f"{q} ({reason})" if reason else q)
+        else:
+            unanswered.append(str(u))
 
-def _search_gmail(query: str) -> list[SourceHit]:
-    """Search Gmail via tools.py executor (with proxy fallback)."""
-    from .tools import execute_tool
-
-    raw = execute_tool("search_gmail", {"query": query, "max_results": 5})
-    data = _parse_tool_result(raw)
-
-    if "error" in data:
-        logger.warning("Gmail search error: %s", data["error"])
-        return []
-
-    hits: list[SourceHit] = []
-    for email in data.get("results", []):
-        hits.append(SourceHit(
-            answer=email.get("snippet", ""),
-            source_type="Gmail",
-            source_name=f"{email.get('subject', '')} (de {email.get('from', '')})",
-            date=email.get("date", ""),
-            confidence="Media",
-        ))
-    return hits
-
-
-def _search_slack(query: str) -> list[SourceHit]:
-    """Search Slack via tools.py executor (with proxy fallback)."""
-    from .tools import execute_tool
-
-    raw = execute_tool("search_slack", {"query": query, "max_results": 5})
-    data = _parse_tool_result(raw)
-
-    if "error" in data:
-        logger.warning("Slack search error: %s", data["error"])
-        return []
-
-    hits: list[SourceHit] = []
-    for msg in data.get("results", []):
-        hits.append(SourceHit(
-            answer=(msg.get("text") or "")[:300],
-            source_type="Slack",
-            source_name=f"#{msg.get('channel', '')} (@{msg.get('user', '')})",
-            date=msg.get("timestamp", ""),
-            confidence="Baja",
-        ))
-    return hits
-
-
-def _assign_confidence(hits: list[SourceHit]) -> None:
-    """Upgrade confidence when multiple sources agree or source is formal."""
-    for h in hits:
-        if h.source_type == "Drive":
-            h.confidence = "Alta"
-        elif h.source_type == "Gmail":
-            h.confidence = "Media"
-    # Multiple source types confirming → bump
-    source_types = {h.source_type for h in hits}
-    if len(source_types) > 1:
-        for h in hits:
-            if h.confidence == "Media":
-                h.confidence = "Alta"
-
-
-def _search_all_sources(question: str) -> list[SourceHit]:
-    """Search Drive, Gmail, and Slack for a question."""
-    keywords = _keywords_from_question(question)
-    if not keywords:
-        return []
-
-    hits: list[SourceHit] = []
-    hits.extend(_search_drive(keywords))
-    hits.extend(_search_gmail(keywords))
-    hits.extend(_search_slack(keywords))
-    _assign_confidence(hits)
-    return hits
+    return ContextResult(suggestions=suggestions, unanswered=unanswered)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def suggest_answers(assistant_text: str) -> ContextResult | None:
-    """Analyse an agent's response, search internal sources, return suggestions.
+def suggest_answers(
+    assistant_text: str,
+    agent_name: str = "discover",
+) -> ContextResult | None:
+    """Run the full CONTEXT pipeline: PLAN -> EXECUTE -> SYNTHESIZE.
 
     Args:
-        assistant_text: The raw text output from the agent.
+        assistant_text: Raw text output from the agent.
+        agent_name: Which agent is asking (affects search strategy and scoring).
 
     Returns:
-        A ``ContextResult`` with suggestions and unanswered questions,
-        or ``None`` if the agent text contained no questions.
+        ContextResult with scored suggestions, or None if no questions found.
     """
-    questions = extract_questions(assistant_text)
-    if not questions:
+    from .config import AGENTS
+
+    agent_info = AGENTS.get(agent_name, {})
+    agent_description = agent_info.get("description", "Agent")
+
+    # Phase 1: PLAN
+    planned = _plan_searches(agent_name, agent_description, assistant_text)
+    if not planned:
         return None
 
-    suggestions: list[QuestionSuggestion] = []
-    unanswered: list[str] = []
+    # Phase 2: EXECUTE
+    raw_results = _execute_searches(planned)
 
-    for q in questions:
-        hits = _search_all_sources(q)
-        if hits:
-            suggestions.append(QuestionSuggestion(question=q, hits=hits))
-        else:
-            unanswered.append(q)
+    # Phase 3: SYNTHESIZE
+    result = _synthesize(agent_name, agent_description, raw_results)
 
-    if not suggestions:
+    if not result.suggestions and not result.unanswered:
         return None
 
-    return ContextResult(suggestions=suggestions, unanswered=unanswered)
+    return result
 
 
 def format_suggestions(result: ContextResult) -> str:
-    """Format a ``ContextResult`` into the user-facing display string."""
+    """Format a ContextResult for the CEO."""
     lines: list[str] = []
     lines.append("\n  CONTEXT encontro respuestas sugeridas:\n")
 
-    for qs in result.suggestions:
-        lines.append(f"  **{qs.question}**")
-        # Show best hit (first) prominently; others as additional sources
-        for i, hit in enumerate(qs.hits):
-            prefix = "  -> Sugerencia" if i == 0 else "     Tambien"
-            lines.append(f"  {prefix}: {hit.answer}")
-            lines.append(f"     Fuente: {hit.source_type} - {hit.source_name}")
-            lines.append(f"     Fecha: {hit.date}")
-            lines.append(f"     Confianza: {hit.confidence}")
+    for s in result.suggestions:
+        lines.append(f"  **{s.question}** [{s.score}/10]")
+        lines.append(f"  -> Sugerencia: {s.answer}")
+        lines.append(f"     Fuente: {s.source_type} - {s.source_name}")
+        lines.append(f"     Fecha: {s.date}")
+        lines.append(f"     Evaluacion: {s.reasoning}")
         lines.append("")
 
     if result.unanswered:
-        lines.append("  No encontre respuesta para:")
+        lines.append("  No encontre respuesta suficiente para:")
         for q in result.unanswered:
             lines.append(f"  - {q}")
         lines.append("")
@@ -284,7 +449,6 @@ def format_suggestions(result: ContextResult) -> str:
 def compile_confirmed_answers(result: ContextResult) -> str:
     """Turn confirmed suggestions into a plain-text reply for the agent."""
     parts: list[str] = []
-    for qs in result.suggestions:
-        best = qs.hits[0]
-        parts.append(f"{qs.question}\n-> {best.answer}")
+    for s in result.suggestions:
+        parts.append(f"{s.question}\n-> {s.answer}")
     return "\n\n".join(parts)
