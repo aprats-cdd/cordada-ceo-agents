@@ -2,11 +2,13 @@
 
 A 10-agent pipeline for CEO-level decision-making, document generation, and stakeholder communication. Built on the Anthropic Messages API with integrated tools (web search, Google Workspace, Slack).
 
+**Core invariant:** Every decision is sustained by explicit models, and every model by traceable observations. The epistemic chain is always `OBSERVATION → MODEL → DECISION` — never decision→decision, never observation→decision.
+
 ---
 
 ## Architecture
 
-The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Data flows strictly downward through layers. Each layer boundary is a human checkpoint (gate).
+The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Data flows strictly downward through layers. Each layer boundary is a human checkpoint (gate). Each agent occupies a defined epistemic phase and is evaluated by its canonical domain expert.
 
 > **Interactive diagram:** open [`docs/architecture.html`](docs/architecture.html) in a browser for an animated, Material 3-styled version of the diagram below.
 
@@ -100,6 +102,43 @@ The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Da
 │   Sonnet call    drive,gmail    Sonnet call                            │
 │                  slack,calendar  score >= 5 → show to CEO              │
 └─────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════
+
+  EPISTEMIC CHAIN — invariant enforced by EventBus
+
+  DISCOVER ─▶ EXTRACT ─▶ VALIDATE ─▶ COMPILE ─▶ AUDIT ─▶ REFLECT ─▶ DECIDE ─▶ DISTRIBUTE
+  [  OBS  ]   [  OBS  ]   [  OBS  ]   [ MOD  ]   [ MOD ]   [ MOD  ]   [ DEC  ]   [ DEC   ]
+  ◄──────── observation ──────────►   ◄────── model ──────►   ◄── decision ──►
+                                                     ▲
+  COLLECT_ITERATE ───────────────────────────────────┘
+  [     OBS      ]    (feedback = new observations → re-enter model phase)
+
+  Rules:  MOD must have upstream OBS or MOD — never DEC
+          DEC must have upstream MOD — never OBS or DEC
+          OBS can start chain or follow DEC (feedback loop)
+
+═══════════════════════════════════════════════════════════════════════════
+
+  EVENT BUS — persisted audit trail per pipeline run
+
+  After each agent:
+    1. Validate epistemic invariant (raise or warn on violation)
+    2. Run canonical evaluation (Claude Sonnet as domain expert → score 1-10)
+    3. Publish AgentEvent to bus (persisted to events_{run_id}.json)
+
+  Pipeline output includes:
+    [OBS] DISCOVER      [7/10]
+    [OBS] EXTRACT       [8/10]
+    [OBS] VALIDATE      [6/10]
+    [MOD] COMPILE       [8/10]
+    [MOD] AUDIT         [7/10]
+    [MOD] REFLECT       [9/10]
+    [DEC] DECIDE        [8/10]
+
+    Chain: OBS → OBS → OBS → MOD → MOD → MOD → DEC
+    Epistemic invariant: VALID
+    Average: 7.6/10
 ```
 
 ### Key design properties
@@ -112,23 +151,40 @@ The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Da
 | **Tool fallback** | Every tool has a 3-tier strategy: (1) direct API if credentials exist, (2) Claude proxy if auth fails, (3) `manual_fallback` for write operations without credentials. Agents never receive an error for missing credentials. |
 | **Feedback loop** | COLLECT_ITERATE feeds back to AUDIT, not DISCOVER. This avoids re-researching; it re-evaluates the same document with new stakeholder input. |
 | **CONTEXT middleware** | CONTEXT intercepts every agent question in interactive mode. It runs a 3-phase pipeline (PLAN → EXECUTE → SYNTHESIZE) using two lightweight Sonnet calls. Scoring is contextual: Claude adopts the canonical domain expert for the calling agent's role (e.g., auditor for VALIDATE, strategy advisor for DECIDE). Only suggestions scoring ≥ 5/10 reach the CEO. |
+| **Epistemic invariant** | `OBSERVATION → MODEL → DECISION`. Every decision is sustained by explicit models, every model by traceable observations. The EventBus validates this at every agent transition. A DECISION never rests on another DECISION or directly on OBSERVATIONS. Structurally enforced by `canonical.py` phase assignments. |
+| **Canonical evaluation** | After each agent runs, its output is evaluated by Claude adopting the perspective of the canonical domain expert for that agent's role (e.g., auditor for VALIDATE, strategy advisor for DECIDE). Scored 1-10 on criteria specific to each agent. Results persist in the EventBus. |
+| **Event bus** | Every agent execution publishes an `AgentEvent` to a file-backed bus (`events_{run_id}.json`). Events include: epistemic phase, evaluation score, invariant check, input/output summaries. Enables post-mortem analysis and quality tracking across runs. |
 | **Token budget** | Context accumulation is dynamically sized to fit within model limits. Prior outputs are proportionally truncated — the most recent agent's output is always passed in full. |
 | **Graceful shutdown** | Ctrl+C during a pipeline run saves state to manifest and commits to GitHub. The pipeline can be resumed exactly where it stopped. |
 
-## Agents
+## Agents — Canonical Definitions
 
-| # | Agent | Layer | Tools | Purpose |
-|---|-------|-------|-------|---------|
-| 01 | **DISCOVER** | Feed | web_search, drive, slack | Research and rank sources on any topic |
-| 02 | **EXTRACT** | Feed | drive, slack | Pull key data, arguments, frameworks from sources |
-| 03 | **VALIDATE** | Feed | web_search | Verify accuracy, consistency, bias, regulatory risk |
-| 04 | **COMPILE** | Feed | — | Generate structured document (Minto Pyramid) |
-| 05 | **AUDIT** | Interpret | — | Multi-expert panel review (legal, persuasion, logic) |
-| 06 | **REFLECT** | Decide | — | Strategic stress-test before decision |
-| 07 | **DECIDE** | Decide | — | Present 2-3 options with trade-offs for CEO decision |
-| 08 | **DISTRIBUTE** | Distribute | slack, gmail | Adapt deliverable to channel (WhatsApp, Slack, email) |
-| 09 | **COLLECT+ITERATE** | Feedback | slack, gmail | Parse stakeholder feedback, re-inject into pipeline |
-| 10 | **CONTEXT** | Support | drive, gmail, slack, calendar | 3-phase middleware: PLAN → EXECUTE → SYNTHESIZE with 1-10 scoring |
+Each agent has a defined epistemic phase, a canonical referent (domain expert that evaluates its output), and specific evaluation criteria.
+
+| # | Agent | Phase | Canonical Referent | Purpose | Output Artifact |
+|---|-------|-------|--------------------|---------|-----------------|
+| 01 | **DISCOVER** | OBS | Analista senior de research | Buscar, filtrar y priorizar fuentes relevantes | Catálogo de fuentes con fichas bibliográficas |
+| 02 | **EXTRACT** | OBS | Data analyst financiero | Extraer datos, argumentos y cifras de las fuentes | Fichas de extracción estructuradas |
+| 03 | **VALIDATE** | OBS | Auditor / fact-checker | Verificar precisión, consistencia, sesgo y vigencia | Reporte de validación con scoring por dato |
+| 04 | **COMPILE** | MOD | Consultor estratégico senior | Transformar observaciones en documento estructurado | Documento Minto Pyramid con trazabilidad |
+| 05 | **AUDIT** | MOD | Panel multi-experto (legal, financiero, reg.) | Revisión multi-dimensional del modelo | Veredicto con scoring dimensional |
+| 06 | **REFLECT** | MOD | Devil's advocate estratégico | Stress-test de supuestos y escenarios adversos | Reporte de robustez y sensibilidad |
+| 07 | **DECIDE** | DEC | Strategy advisor de C-suite | Presentar opciones sustentadas en modelos | Menú de decisión con trade-offs |
+| 08 | **DISTRIBUTE** | DEC | Director de comunicaciones corporativas | Adaptar la decisión al canal y destinatario | Mensaje adaptado por canal |
+| 09 | **COLLECT+IT** | OBS | Product manager senior | Estructurar feedback como nuevas observaciones | Feedback con scoring señal/ruido |
+| 10 | **CONTEXT** | — | (per-agent, see middleware) | Middleware: PLAN → EXECUTE → SYNTHESIZE | Sugerencias con score 1-10 |
+
+### Evaluation criteria per agent
+
+Each agent is scored 1-10 on 5 criteria specific to its role. Example for **COMPILE** (model phase):
+
+1. **Estructura lógica** — ¿La pirámide argumental es coherente (tesis→argumentos→evidencia)?
+2. **Trazabilidad** — ¿Cada afirmación del modelo apunta a observaciones de VALIDATE?
+3. **Completitud** — ¿El modelo incorpora todas las observaciones relevantes?
+4. **Claridad** — ¿Un lector externo puede seguir el argumento sin conocimiento previo?
+5. **Fidelidad** — ¿El modelo NO agrega interpretaciones sin sustento en observaciones?
+
+Full criteria for all agents are defined in `orchestrator/canonical.py:AGENT_CANON`.
 
 ## Tool System
 
@@ -360,6 +416,8 @@ cordada-ceo-agents/
 ├── orchestrator/
 │   ├── __init__.py           ← Public API (investigate, agent, decide, context)
 │   ├── config.py             ← Configuration, model selection, agent registry
+│   ├── canonical.py          ← Agent canon: phases, criteria, evaluation, invariant
+│   ├── event_bus.py          ← Event bus: traceable audit trail + invariant enforcement
 │   ├── agent_runner.py       ← Run agents via API with tool execution loop
 │   ├── pipeline.py           ← Chain agents with gate-based pause/resume
 │   ├── gates.py              ← Gate handlers (terminal, auto)
@@ -382,6 +440,7 @@ cordada-ceo-agents/
 | DISCOVER → DISTRIBUTE | claude-sonnet-4-20250514 | Best balance of quality and cost |
 | AUDIT, REFLECT, DECIDE | claude-opus-4-6 | Strategic evaluation requires maximum quality |
 | CONTEXT middleware (2 calls) | claude-sonnet-4-20250514 | PLAN + SYNTHESIZE phases, ~3K tokens per turn |
+| Canonical evaluation (1 call/agent) | claude-sonnet-4-20250514 | Post-hoc quality scoring, ~2K tokens per eval |
 | Claude proxy fallback | claude-sonnet-4-20250514 | Data retrieval proxy |
 
 ## Design Patterns
@@ -395,7 +454,9 @@ cordada-ceo-agents/
 | Reflection | REFLECT | Gullí (2025) Ch. 4 |
 | Human-in-the-Loop | Gates at AUDIT → COLLECT_ITERATE | Gullí (2025) Ch. 13 |
 | Guardrails | VALIDATE | Gullí (2025) Ch. 12 |
-| Canonical Evaluation | CONTEXT scores by domain expert | — |
+| Canonical Evaluation | Every agent scored 1-10 by domain expert | — |
+| Epistemic Invariant | OBS→MOD→DEC enforced by EventBus | — |
+| Event Sourcing | File-backed audit trail per pipeline run | — |
 | Graceful Degradation | Tool fallback via Claude proxy | — |
 
 ## References

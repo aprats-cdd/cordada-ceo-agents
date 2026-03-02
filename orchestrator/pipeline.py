@@ -26,6 +26,8 @@ from pathlib import Path
 
 from .config import AGENTS, OUTPUTS_DIR, get_model
 from .agent_runner import run_agent
+from .canonical import evaluate_output, validate_epistemic_chain, AGENT_CANON
+from .event_bus import EventBus
 from .gates import (
     GateContext,
     GateResult,
@@ -64,6 +66,7 @@ def run_pipeline(
     on_gate: GateHandler = terminal_gate,
     prior_outputs: dict[str, str] | None = None,
     no_context: bool = False,
+    evaluate: bool = True,
 ) -> dict[str, str]:
     """
     Run a sequence of agents, passing outputs forward.
@@ -82,6 +85,7 @@ def run_pipeline(
         prior_outputs: Outputs from previous agents (used when resuming).
                        Merged into the returned dict so callers get the full picture.
         no_context: If True, disable CONTEXT middleware in interactive agents.
+        evaluate: If True, run canonical evaluation after each agent (default: True).
 
     Returns:
         Dict mapping agent names to their outputs
@@ -140,6 +144,12 @@ def run_pipeline(
 
     outputs = dict(prior_outputs) if prior_outputs else {}
 
+    # Event bus for epistemic traceability
+    bus = EventBus(
+        run_id=f"pipeline_{timestamp}",
+        persist_dir=run_dir,
+    )
+
     # Graceful shutdown: save state on Ctrl+C instead of losing work (Fix #12)
     _shutdown_requested = False
     _original_sigint = signal.getsignal(signal.SIGINT)
@@ -161,6 +171,8 @@ def run_pipeline(
             interactive_at, project_dir, project_name, run_dir,
             lambda: _shutdown_requested,
             no_context=no_context,
+            bus=bus,
+            evaluate=evaluate,
         )
     finally:
         signal.signal(signal.SIGINT, _original_sigint)
@@ -177,6 +189,15 @@ def run_pipeline(
         push_project(project_dir)
 
     completed_agents = [a for a in sequence if a in outputs]
+
+    # Print epistemic chain and evaluation summary
+    if bus.events:
+        print(f"\n{'─'*60}")
+        print(f"  EPISTEMIC CHAIN")
+        print(bus.get_chain_summary())
+        print(f"\n{bus.get_scores_summary()}")
+        print(f"{'─'*60}")
+
     if len(completed_agents) == len(sequence):
         print(f"\n{'#'*60}")
         print(f"  PIPELINE COMPLETE")
@@ -208,6 +229,8 @@ def _run_pipeline_loop(
     run_dir: Path,
     is_shutdown_requested,
     no_context: bool = False,
+    bus: EventBus | None = None,
+    evaluate: bool = True,
 ) -> None:
     """Inner pipeline loop, extracted so the caller can wrap with signal handling."""
     current_input = initial_input
@@ -361,6 +384,25 @@ def _run_pipeline_loop(
 
         outputs[agent_name] = response
         current_input = response
+
+        # Canonical evaluation + event bus
+        if bus:
+            eval_result = None
+            if evaluate:
+                canon = AGENT_CANON.get(agent_name)
+                if canon:
+                    print(f"  Evaluating {agent_name.upper()} "
+                          f"[{canon.phase.value}] as {canon.canonical_referent[:50]}...")
+                    eval_result = evaluate_output(agent_name, response)
+                    if eval_result:
+                        print(f"  Score: {eval_result.score}/10 — {eval_result.reasoning}")
+
+            bus.publish(
+                agent_name=agent_name,
+                output=response,
+                evaluation=eval_result,
+                input_text=pipeline_context,
+            )
 
         # Project mode: commit each agent output
         if project_dir:
