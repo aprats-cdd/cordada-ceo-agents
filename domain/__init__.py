@@ -7,7 +7,8 @@ persistence).  All infrastructure concerns live in ``orchestrator/`` or
 future ``infrastructure/`` packages.
 
 Bounded contexts:
-    model       — Value objects: AgentDefinition, EpistemicPhase, AgentEvaluation
+    model       — Value objects: AgentDefinition, EpistemicPhase, AgentEvaluation,
+                    TokenUsage, CostBudget
     registry    — Single source of truth: AGENTS dict (unified config + canon)
     events      — Domain events: AgentEvent, EventBus, InvariantViolation
     invariant   — Epistemic chain validation (observation → model → decision)
@@ -20,7 +21,7 @@ DDD alignment (Evans, 2003):
     - validate_epistemic_chain() is a Domain Invariant
 """
 
-from .model import AgentDefinition, EpistemicPhase, AgentEvaluation
+from .model import AgentDefinition, EpistemicPhase, AgentEvaluation, TokenUsage, CostBudget
 from .registry import AGENTS, PIPELINE_ORDER, get_agent, get_model_for_agent
 from .events import AgentEvent, EventBus, InvariantViolation
 from .invariant import validate_epistemic_chain, VALID_UPSTREAM
@@ -30,6 +31,8 @@ __all__ = [
     "AgentDefinition",
     "EpistemicPhase",
     "AgentEvaluation",
+    "TokenUsage",
+    "CostBudget",
     # Registry
     "AGENTS",
     "PIPELINE_ORDER",

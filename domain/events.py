@@ -17,7 +17,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 
-from .model import AgentEvaluation
+from .model import AgentEvaluation, TokenUsage
 from .registry import AGENTS
 from .invariant import validate_epistemic_chain
 
@@ -42,6 +42,9 @@ class AgentEvent:
     upstream_event_id: str | None = None
     invariant_valid: bool = True
     invariant_note: str = ""
+    # Cost governance fields
+    token_usage: dict | None = None       # serialized TokenUsage (asdict)
+    cumulative_cost_usd: float = 0.0
 
 
 class EventBus:
@@ -74,6 +77,7 @@ class EventBus:
         output: str,
         evaluation: AgentEvaluation | None = None,
         input_text: str = "",
+        token_usage: TokenUsage | None = None,
     ) -> AgentEvent:
         """Record an agent execution event."""
         agent = AGENTS.get(agent_name)
@@ -88,6 +92,11 @@ class EventBus:
                 raise InvariantViolation(note)
             logger.warning("EPISTEMIC INVARIANT: %s", note)
 
+        # Compute cumulative cost across the run
+        prev_cumulative = self.events[-1].cumulative_cost_usd if self.events else 0.0
+        agent_cost = token_usage.cost_usd if token_usage else 0.0
+        cumulative = round(prev_cumulative + agent_cost, 6)
+
         event = AgentEvent(
             event_id=f"{self.run_id}_{agent_name}_{len(self.events):03d}",
             timestamp=datetime.now().isoformat(),
@@ -100,6 +109,8 @@ class EventBus:
             upstream_event_id=upstream_event.event_id if upstream_event else None,
             invariant_valid=valid,
             invariant_note=note,
+            token_usage=asdict(token_usage) if token_usage else None,
+            cumulative_cost_usd=cumulative,
         )
 
         self.events.append(event)
@@ -168,6 +179,27 @@ class EventBus:
         if scores:
             lines.append(f"\n  Average: {sum(scores)/len(scores):.1f}/10")
 
+        return "\n".join(lines)
+
+    def get_cost_summary(self) -> str:
+        """Summary of token usage and costs across the pipeline run."""
+        if not self.events:
+            return "No events recorded."
+
+        lines: list[str] = ["  Cost Summary (stop-loss report):"]
+        for e in self.events:
+            if e.token_usage:
+                tu = e.token_usage
+                lines.append(
+                    f"    {e.agent.upper():20s} "
+                    f"in={tu['input_tokens']:>6} out={tu['output_tokens']:>6} "
+                    f"${tu['cost_usd']:.4f}  cumul=${e.cumulative_cost_usd:.4f}"
+                )
+            else:
+                lines.append(f"    {e.agent.upper():20s} (no usage data)")
+
+        total = self.events[-1].cumulative_cost_usd if self.events else 0.0
+        lines.append(f"\n  Total pipeline cost: ${total:.4f}")
         return "\n".join(lines)
 
     def _persist(self) -> None:
