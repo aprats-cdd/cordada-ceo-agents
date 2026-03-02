@@ -26,53 +26,12 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from domain.registry import AGENTS
+
 logger = logging.getLogger(__name__)
 
 # Model used for CONTEXT calls (lightweight, fast)
 _CONTEXT_MODEL = "claude-sonnet-4-20250514"
-
-# ---------------------------------------------------------------------------
-# Canonical domain experts per agent
-# ---------------------------------------------------------------------------
-
-AGENT_DOMAINS: dict[str, str] = {
-    "discover": (
-        "un analista senior de research en asset management. "
-        "Prioriza fuentes primarias, datos verificables y recencia."
-    ),
-    "extract": (
-        "un data analyst financiero. "
-        "Prioriza exactitud numérica, consistencia y trazabilidad del dato."
-    ),
-    "validate": (
-        "un auditor / fact-checker independiente. "
-        "Prioriza corroboración cruzada, ausencia de sesgo y fuentes oficiales."
-    ),
-    "compile": (
-        "un consultor estratégico senior (McKinsey/BCG). "
-        "Prioriza claridad, relevancia para el destinatario y solidez argumentativa."
-    ),
-    "audit": (
-        "un panel multi-experto (legal, financiero, regulatorio). "
-        "Prioriza rigor, completitud y señalamiento de riesgos."
-    ),
-    "reflect": (
-        "un devil's advocate estratégico. "
-        "Prioriza evidencia contraria, supuestos no validados y riesgos ocultos."
-    ),
-    "decide": (
-        "un strategy advisor de C-suite. "
-        "Prioriza impacto en stakeholders, viabilidad y reversibilidad."
-    ),
-    "distribute": (
-        "un director de comunicaciones corporativas. "
-        "Prioriza tono, canal adecuado, timing y sensibilidad del destinatario."
-    ),
-    "collect_iterate": (
-        "un product manager senior. "
-        "Prioriza señal vs ruido en feedback, patrones y accionabilidad."
-    ),
-}
 
 _DEFAULT_DOMAIN = (
     "un profesional senior del dominio relevante. "
@@ -324,7 +283,8 @@ def _synthesize(
     search_results: dict[str, list[dict]],
 ) -> ContextResult:
     """Phase 3: Claude interprets results and scores suggestions."""
-    domain_expert = AGENT_DOMAINS.get(agent_name, _DEFAULT_DOMAIN)
+    agent = AGENTS.get(agent_name)
+    domain_expert = agent.canonical_referent if agent else _DEFAULT_DOMAIN
 
     # Build compact representation for Claude (skip errors, keep data)
     compact: list[dict] = []
@@ -397,10 +357,8 @@ def suggest_answers(
     Returns:
         ContextResult with scored suggestions, or None if no questions found.
     """
-    from .config import AGENTS
-
-    agent_info = AGENTS.get(agent_name, {})
-    agent_description = agent_info.get("description", "Agent")
+    agent_def = AGENTS.get(agent_name)
+    agent_description = agent_def.description if agent_def else "Agent"
 
     # Phase 1: PLAN
     planned = _plan_searches(agent_name, agent_description, assistant_text)

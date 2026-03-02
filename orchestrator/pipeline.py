@@ -24,10 +24,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .config import AGENTS, OUTPUTS_DIR, get_model
+from domain.registry import AGENTS, get_model_for_agent as get_model
+from domain.events import EventBus
+
+from .config import OUTPUTS_DIR
 from .agent_runner import run_agent
-from .canonical import evaluate_output, validate_epistemic_chain, AGENT_CANON
-from .event_bus import EventBus
+from .canonical import evaluate_output
 from .gates import (
     GateContext,
     GateResult,
@@ -389,7 +391,7 @@ def _run_pipeline_loop(
         if bus:
             eval_result = None
             if evaluate:
-                canon = AGENT_CANON.get(agent_name)
+                canon = AGENTS.get(agent_name)
                 if canon:
                     print(f"  Evaluating {agent_name.upper()} "
                           f"[{canon.phase.value}] as {canon.canonical_referent[:50]}...")

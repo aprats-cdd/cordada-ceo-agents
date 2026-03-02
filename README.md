@@ -395,42 +395,78 @@ python -m orchestrator agent discover --input "tu tema de investigación"
 
 > Without Google/Slack credentials, tools automatically fall back to `call_claude_as_proxy()`.
 
-## Project Structure
+## Project Structure (DDD)
+
+The codebase follows Domain-Driven Design (Evans, 2003) with clean separation between the domain model, application services, and infrastructure.
 
 ```
 cordada-ceo-agents/
-├── README.md
-├── docs/
-│   └── architecture.html    ← Interactive architecture diagram (Material 3)
-├── agents/                   ← Agent prompts (usable standalone in Claude.ai)
-│   ├── 01_discover.md
-│   ├── 02_extract.md
-│   ├── 03_validate.md
-│   ├── 04_compile.md
-│   ├── 05_audit.md
-│   ├── 06_reflect.md
-│   ├── 07_decide.md
-│   ├── 08_distribute.md
-│   ├── 09_collect_iterate.md
-│   └── 10_context.md
-├── orchestrator/
-│   ├── __init__.py           ← Public API (investigate, agent, decide, context)
-│   ├── config.py             ← Configuration, model selection, agent registry
-│   ├── canonical.py          ← Agent canon: phases, criteria, evaluation, invariant
-│   ├── event_bus.py          ← Event bus: traceable audit trail + invariant enforcement
-│   ├── agent_runner.py       ← Run agents via API with tool execution loop
-│   ├── pipeline.py           ← Chain agents with gate-based pause/resume
-│   ├── gates.py              ← Gate handlers (terminal, auto)
-│   ├── tools.py              ← Tool definitions, executors, Claude proxy fallback
-│   ├── context_middleware.py ← 3-phase CONTEXT: PLAN → EXECUTE → SYNTHESIZE
-│   └── project.py            ← GitHub repo creation + traceability
-├── outputs/                  ← Pipeline outputs (gitignored)
-├── projects/                 ← Project repos (gitignored)
-├── tests/                   ← 63 unit tests
-├── pyproject.toml           ← Package definition with optional deps
-├── requirements.txt
-├── .env.example
-└── .gitignore
+│
+├── domain/                        ← BOUNDED CONTEXT: Core domain (no external deps)
+│   ├── __init__.py                   Exports: AgentDefinition, EpistemicPhase, EventBus
+│   ├── model.py                     Value objects: AgentDefinition, EpistemicPhase,
+│   │                                  AgentEvaluation
+│   ├── registry.py                  Single source of truth: AGENTS dict
+│   │                                  (unified config + canon + evaluation criteria)
+│   ├── events.py                    Domain events: AgentEvent, EventBus,
+│   │                                  InvariantViolation
+│   └── invariant.py                 Epistemic chain validation (pure logic, no I/O)
+│
+├── agents/                        ← Domain artifacts (usable standalone in Claude.ai)
+│   ├── 01_discover.md ... 10_context.md
+│
+├── orchestrator/                  ← APPLICATION + INTERFACE layer
+│   ├── __init__.py                   Public Python API + re-exports from domain/
+│   ├── __main__.py                   CLI entry point
+│   ├── config.py                     Infrastructure config: env vars, paths
+│   │                                  (re-exports AGENTS from domain for compat)
+│   ├── canonical.py                  Evaluation service: Claude API calls
+│   │                                  (re-exports domain types for compat)
+│   ├── event_bus.py                  Re-export from domain.events
+│   ├── agent_runner.py               Agent execution: API calls, tool loop, metrics
+│   ├── pipeline.py                   Pipeline orchestration: sequence, gates, context
+│   ├── gates.py                      Gate handlers: terminal_gate, auto_gate
+│   ├── tools.py                      Tool registry + executors + Claude proxy fallback
+│   ├── context_middleware.py         3-phase CONTEXT: PLAN → EXECUTE → SYNTHESIZE
+│   └── project.py                    GitHub project management
+│
+├── tests/                         ← Unit tests
+├── docs/                          ← architecture.html (Material 3 interactive diagram)
+├── examples/                      ← carta_aportantes.py
+├── outputs/                       ← Pipeline outputs (gitignored)
+└── projects/                      ← Project repos (gitignored)
+```
+
+### DDD layer responsibilities
+
+| Layer | Package | Depends on | Responsibility |
+|-------|---------|------------|----------------|
+| **Domain** | `domain/` | nothing | Value objects, aggregates, invariants, events. Zero external dependencies. |
+| **Application** | `orchestrator/` | `domain/` | Use cases: run agents, orchestrate pipelines, evaluate outputs, search context. |
+| **Infrastructure** | `orchestrator/tools.py`, `config.py` | `domain/`, external APIs | Anthropic API, Google Workspace, Slack, GitHub, file I/O. |
+| **Interface** | `orchestrator/__init__.py`, `__main__.py` | `application/` | Python API, CLI. |
+
+Dependencies flow **inward**: interface → application → domain. The domain layer never imports from orchestrator.
+
+### Unified agent definition (single source of truth)
+
+Previously, agent identity was split across two registries that could drift:
+- `config.AGENTS` — pipeline config (order, layer, file, next)
+- `canonical.AGENT_CANON` — epistemic definitions (phase, criteria, referent)
+
+Now there is ONE `AgentDefinition` per agent in `domain.registry.AGENTS`:
+
+```python
+from domain import AGENTS
+
+agent = AGENTS["compile"]
+agent.order              # 4
+agent.layer              # "feed"
+agent.phase              # EpistemicPhase.MODEL
+agent.prompt_file        # "04_compile.md"
+agent.canonical_referent # "Consultor estratégico senior (McKinsey/BCG)..."
+agent.evaluation_criteria  # tuple of 5 criteria
+agent["file"]            # "04_compile.md" (legacy dict access, backward compat)
 ```
 
 ## Model Selection
@@ -461,6 +497,7 @@ cordada-ceo-agents/
 
 ## References
 
+- Evans, E. (2003). *Domain-Driven Design: Tackling Complexity in the Heart of Software*. Addison-Wesley.
 - Gullí, A. (2025). *Agentic Design Patterns: A Hands-On Guide to Building Intelligent Systems*. Springer Nature.
 - Anthropic. (2025). [Building agents with the Claude Agent SDK](https://www.anthropic.com/engineering/building-agents-with-the-claude-agent-sdk).
 - Anthropic. (2025). [Code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp).
