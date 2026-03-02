@@ -38,16 +38,12 @@ GOOGLE_DELEGATE_EMAIL = os.getenv("GOOGLE_DELEGATE_EMAIL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 # --- CONTEXT Middleware ---
-# When True (and --context flag is passed), the CONTEXT middleware
-# intercepts agent questions in interactive mode and searches internal
-# sources for suggested answers.
+# The CONTEXT middleware intercepts agent questions in interactive mode
+# and searches internal sources (Drive, Gmail, Slack) for suggested
+# answers.  Uses the same tool executors as agents — always works via
+# proxy even without direct API credentials.
+# Set to false to disable globally; or use --no-context at runtime.
 CONTEXT_ENABLED = os.getenv("CONTEXT_ENABLED", "true").lower() in ("true", "1", "yes")
-# Comma-separated list of sources to search: drive, gmail, slack
-CONTEXT_SOURCES: set[str] = {
-    s.strip()
-    for s in os.getenv("CONTEXT_SOURCES", "drive,gmail,slack").split(",")
-    if s.strip()
-}
 
 # --- Model Selection ---
 # claude-sonnet-4-20250514: Best balance of quality and cost for most agents

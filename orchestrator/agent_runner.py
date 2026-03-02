@@ -29,7 +29,6 @@ from .config import (
     AGENTS,
     OUTPUTS_DIR,
     CONTEXT_ENABLED,
-    CONTEXT_SOURCES,
     get_model,
     get_agent_prompt,
 )
@@ -353,19 +352,14 @@ def _run_interactive(
     messages = [{"role": "user", "content": initial_input}]
     all_responses: list[str] = []
 
-    # --- CONTEXT middleware setup (active by default) ---
-    ctx_available = False
-    ctx_sources: set[str] = set()
+    # --- CONTEXT middleware (active by default) ---
+    # Uses the same tool executors as agents, so the proxy fallback
+    # (Claude with MCP) is always available — no credentials required.
+    use_context = not no_context and CONTEXT_ENABLED
     if no_context:
-        pass  # user explicitly disabled CONTEXT
+        pass
     elif not CONTEXT_ENABLED:
-        print("\n  CONTEXT middleware deshabilitado via CONTEXT_ENABLED=false en .env\n")
-    else:
-        from .context_middleware import check_availability
-        ctx_available, warning = check_availability(CONTEXT_SOURCES)
-        ctx_sources = CONTEXT_SOURCES
-        if warning:
-            print(f"\n  {warning}\n")
+        print("\n  CONTEXT deshabilitado via CONTEXT_ENABLED=false en .env\n")
 
     print("  Interactive mode. Type your answers. Type 'done' to finish.\n")
 
@@ -396,8 +390,7 @@ def _run_interactive(
         if message.stop_reason == "end_turn":
             user_reply = _prompt_with_context(
                 assistant_text,
-                ctx_available=ctx_available,
-                ctx_sources=ctx_sources,
+                use_context=use_context,
             )
             if user_reply is None:  # user typed 'done'
                 break
@@ -416,8 +409,7 @@ def _run_interactive(
 def _prompt_with_context(
     assistant_text: str,
     *,
-    ctx_available: bool,
-    ctx_sources: set[str],
+    use_context: bool,
 ) -> str | None:
     """Prompt the user, optionally showing CONTEXT suggestions first.
 
@@ -425,14 +417,14 @@ def _prompt_with_context(
         The user's reply string, or ``None`` when the user types 'done'.
         An empty string means "skip" (no input).
     """
-    if ctx_available:
+    if use_context:
         from .context_middleware import (
             suggest_answers,
             format_suggestions,
             compile_confirmed_answers,
         )
 
-        result = suggest_answers(assistant_text, sources=ctx_sources)
+        result = suggest_answers(assistant_text)
         if result:
             print(format_suggestions(result))
             choice = input("\n  Tu eleccion (1/2/3): ").strip()
