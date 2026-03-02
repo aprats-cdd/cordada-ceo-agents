@@ -24,6 +24,8 @@ from pathlib import Path
 
 import anthropic
 
+from domain.model import TokenUsage
+
 from .config import (
     ANTHROPIC_API_KEY,
     AGENTS,
@@ -59,12 +61,14 @@ class RunMetrics:
     tool_calls: int = 0
     tool_rounds: int = 0
     proxy_calls: int = 0
+    token_usage: TokenUsage | None = None  # Aggregated after run
 
     def __str__(self) -> str:
+        cost_str = f", ${self.token_usage.cost_usd:.4f}" if self.token_usage else ""
         return (
             f"[{self.agent}] {self.model} — "
             f"{self.latency_ms}ms, "
-            f"{self.input_tokens}+{self.output_tokens} tokens, "
+            f"{self.input_tokens}+{self.output_tokens} tokens{cost_str}, "
             f"{self.tool_calls} tool calls ({self.tool_rounds} rounds)"
         )
 
@@ -146,6 +150,7 @@ def run_agent(
     save: bool = True,
     verbose: bool = True,
     no_context: bool = False,
+    max_output_tokens: int | None = None,
 ) -> str:
     """
     Run a single agent with the given input.
@@ -212,7 +217,34 @@ def run_agent(
         )
 
     metrics.latency_ms = int((time.monotonic() - start_time) * 1000)
+
+    # Compute aggregate TokenUsage for cost governance
+    metrics.token_usage = TokenUsage(
+        input_tokens=metrics.input_tokens,
+        output_tokens=metrics.output_tokens,
+        model=model,
+        cost_usd=TokenUsage.from_api_response(
+            {"usage": {"input_tokens": metrics.input_tokens, "output_tokens": metrics.output_tokens}},
+            model,
+        ).cost_usd,
+    )
+
     last_metrics = metrics
+
+    # Cost governor: truncate output if it exceeds the per-agent token cap
+    if max_output_tokens and metrics.output_tokens > max_output_tokens:
+        # Approximate char count from tokens (4 chars/token)
+        max_chars = max_output_tokens * 4
+        if len(response) > max_chars:
+            response = response[:max_chars] + (
+                "\n\n[OUTPUT TRUNCATED BY COST GOVERNOR — "
+                f"exceeded {max_output_tokens} output tokens]"
+            )
+            if verbose:
+                logger.warning(
+                    "Agent '%s' output truncated: %d tokens > %d max",
+                    agent_name, metrics.output_tokens, max_output_tokens,
+                )
 
     if verbose:
         logger.info("Metrics: %s", metrics)

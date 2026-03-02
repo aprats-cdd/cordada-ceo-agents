@@ -59,6 +59,11 @@ Examples:
     run_parser.add_argument("--gates", nargs="*", choices=list(AGENTS.keys()), help="Agents where pipeline pauses for CEO review")
     run_parser.add_argument("--resume", type=str, metavar="PROJECT", help="Resume a stopped pipeline")
     run_parser.add_argument("--gate-input", type=str, help="Human input when resuming at a gate")
+    run_parser.add_argument(
+        "--budget-override",
+        action="store_true",
+        help="Continue pipeline even if cost budget (stop-loss) is exceeded",
+    )
 
     # --- agent ---
     agent_parser = subparsers.add_parser(
@@ -120,6 +125,7 @@ Examples:
                 project_name=args.project,
                 project_description=args.project_description,
                 gates=gate_set,
+                budget_override=getattr(args, "budget_override", False),
             )
 
     elif args.command == "agent":

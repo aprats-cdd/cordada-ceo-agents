@@ -45,6 +45,11 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 # --- CONTEXT Middleware ---
 CONTEXT_ENABLED = os.getenv("CONTEXT_ENABLED", "true").lower() in ("true", "1", "yes")
 
+# --- Cost Governance (stop-loss) ---
+COST_BUDGET_MAX_USD = float(os.getenv("COST_BUDGET_MAX_USD", "10.0"))
+COST_MAX_OUTPUT_TOKENS = int(os.getenv("COST_MAX_OUTPUT_TOKENS", "8000"))
+COST_MAX_ITERATIONS = int(os.getenv("COST_MAX_ITERATIONS", "3"))
+
 # --- Paths ---
 ROOT_DIR = Path(__file__).parent.parent
 AGENTS_DIR = ROOT_DIR / "agents"

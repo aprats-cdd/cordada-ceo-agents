@@ -1,4 +1,4 @@
-"""Tests for cost governance domain objects — TokenUsage, CostBudget, and EventBus cost tracking."""
+"""Tests for cost governance — domain objects and orchestrator integration."""
 
 import pytest
 from dataclasses import asdict
