@@ -63,7 +63,7 @@ def run_pipeline(
     gates: set[str] | None = None,
     on_gate: GateHandler = terminal_gate,
     prior_outputs: dict[str, str] | None = None,
-    context_enabled: bool = False,
+    no_context: bool = False,
 ) -> dict[str, str]:
     """
     Run a sequence of agents, passing outputs forward.
@@ -81,7 +81,7 @@ def run_pipeline(
         on_gate: Callback function for gate handling (default: terminal_gate)
         prior_outputs: Outputs from previous agents (used when resuming).
                        Merged into the returned dict so callers get the full picture.
-        context_enabled: If True, activate CONTEXT middleware during interactive agents.
+        no_context: If True, disable CONTEXT middleware in interactive agents.
 
     Returns:
         Dict mapping agent names to their outputs
@@ -160,7 +160,7 @@ def run_pipeline(
             sequence, outputs, topic, current_input, gates, on_gate,
             interactive_at, project_dir, project_name, run_dir,
             lambda: _shutdown_requested,
-            context_enabled=context_enabled,
+            no_context=no_context,
         )
     finally:
         signal.signal(signal.SIGINT, _original_sigint)
@@ -207,7 +207,7 @@ def _run_pipeline_loop(
     project_name: str | None,
     run_dir: Path,
     is_shutdown_requested,
-    context_enabled: bool = False,
+    no_context: bool = False,
 ) -> None:
     """Inner pipeline loop, extracted so the caller can wrap with signal handling."""
     current_input = initial_input
@@ -356,7 +356,7 @@ def _run_pipeline_loop(
             user_input=pipeline_context,
             output_path=output_path,
             interactive=is_interactive,
-            context_enabled=context_enabled and is_interactive,
+            no_context=no_context,
         )
 
         outputs[agent_name] = response
@@ -521,9 +521,9 @@ Examples:
         help="Human input to inject when resuming at a gate",
     )
     parser.add_argument(
-        "--context",
+        "--no-context",
         action="store_true",
-        help="Enable CONTEXT middleware (searches Drive/Gmail/Slack for suggested answers)",
+        help="Disable CONTEXT middleware (skip Drive/Gmail/Slack suggestions in interactive mode)",
     )
 
     args = parser.parse_args()
@@ -556,7 +556,7 @@ Examples:
         project_name=args.project,
         project_description=args.project_description,
         gates=gate_set,
-        context_enabled=args.context,
+        no_context=args.no_context,
     )
 
 

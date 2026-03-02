@@ -146,7 +146,7 @@ def run_agent(
     interactive: bool = False,
     save: bool = True,
     verbose: bool = True,
-    context_enabled: bool = False,
+    no_context: bool = False,
 ) -> str:
     """
     Run a single agent with the given input.
@@ -158,7 +158,7 @@ def run_agent(
         interactive: If True, enable multi-turn conversation
         save: If True, auto-save output to disk (default: True)
         verbose: If True, print progress banners (default: True)
-        context_enabled: If True, activate CONTEXT middleware in interactive mode
+        no_context: If True, disable CONTEXT middleware even in interactive mode
 
     Returns:
         The agent's response text
@@ -187,7 +187,7 @@ def run_agent(
     if interactive:
         response = _run_interactive(
             client, model, system_prompt, user_input, agent_name, tools,
-            context_enabled=context_enabled,
+            no_context=no_context,
         )
     else:
         messages = [{"role": "user", "content": user_input}]
@@ -339,31 +339,33 @@ def _run_interactive(
     initial_input: str,
     agent_name: str,
     tools: list[dict] | None = None,
-    context_enabled: bool = False,
+    no_context: bool = False,
 ) -> str:
     """
     Run an agent in interactive mode (multi-turn conversation).
     The agent asks questions, you answer, it executes when ready.
     Tools are available during the conversation.
 
-    When *context_enabled* is True the CONTEXT middleware intercepts
-    each agent question, searches Drive/Gmail/Slack, and offers
-    suggested answers before prompting for manual input.
+    CONTEXT middleware is active by default — it intercepts each agent
+    question, searches Drive/Gmail/Slack, and offers suggested answers
+    before prompting for manual input.  Pass *no_context=True* to disable.
     """
     messages = [{"role": "user", "content": initial_input}]
     all_responses: list[str] = []
 
-    # --- CONTEXT middleware setup ---
+    # --- CONTEXT middleware setup (active by default) ---
     ctx_available = False
     ctx_sources: set[str] = set()
-    if context_enabled and CONTEXT_ENABLED:
+    if no_context:
+        pass  # user explicitly disabled CONTEXT
+    elif not CONTEXT_ENABLED:
+        print("\n  CONTEXT middleware deshabilitado via CONTEXT_ENABLED=false en .env\n")
+    else:
         from .context_middleware import check_availability
         ctx_available, warning = check_availability(CONTEXT_SOURCES)
         ctx_sources = CONTEXT_SOURCES
         if warning:
             print(f"\n  {warning}\n")
-    elif context_enabled and not CONTEXT_ENABLED:
-        print("\n  CONTEXT middleware deshabilitado via CONTEXT_ENABLED=false en .env\n")
 
     print("  Interactive mode. Type your answers. Type 'done' to finish.\n")
 
@@ -500,9 +502,9 @@ Available agents:
         help="Run in interactive mode (multi-turn conversation)",
     )
     parser.add_argument(
-        "--context",
+        "--no-context",
         action="store_true",
-        help="Enable CONTEXT middleware (searches Drive/Gmail/Slack for suggested answers)",
+        help="Disable CONTEXT middleware (skip Drive/Gmail/Slack suggestions in interactive mode)",
     )
     parser.add_argument(
         "--list",
@@ -540,7 +542,7 @@ Available agents:
         user_input=user_input,
         output_path=output_path,
         interactive=args.interactive,
-        context_enabled=args.context,
+        no_context=args.no_context,
     )
 
     if not args.interactive:
