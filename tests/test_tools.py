@@ -20,9 +20,9 @@ def _env_vars(monkeypatch):
     monkeypatch.delenv("GOOGLE_DELEGATE_EMAIL", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
     # Reset LRU caches so env changes take effect
-    from orchestrator.tools import _is_google_configured, _is_slack_configured
-    _is_google_configured.cache_clear()
-    _is_slack_configured.cache_clear()
+    from infrastructure.tools._shared import is_google_configured, is_slack_configured
+    is_google_configured.cache_clear()
+    is_slack_configured.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +166,7 @@ class TestDriveQueryEscaping:
 # ---------------------------------------------------------------------------
 
 class TestCallClaudeAsProxy:
-    @patch("orchestrator.tools._get_proxy_client")
+    @patch("infrastructure.tools.proxy._get_proxy_client")
     def test_proxy_returns_parsed_json(self, mock_get_client):
         from orchestrator.tools import call_claude_as_proxy
 
@@ -182,7 +182,7 @@ class TestCallClaudeAsProxy:
         result = call_claude_as_proxy("test instruction")
         assert result == {"results": [{"id": "1"}], "total": 1}
 
-    @patch("orchestrator.tools._get_proxy_client")
+    @patch("infrastructure.tools.proxy._get_proxy_client")
     def test_proxy_strips_markdown_fences(self, mock_get_client):
         from orchestrator.tools import call_claude_as_proxy
 
@@ -198,7 +198,7 @@ class TestCallClaudeAsProxy:
         result = call_claude_as_proxy("test")
         assert result == {"key": "value"}
 
-    @patch("orchestrator.tools._get_proxy_client")
+    @patch("infrastructure.tools.proxy._get_proxy_client")
     def test_proxy_handles_non_json(self, mock_get_client):
         from orchestrator.tools import call_claude_as_proxy
 
@@ -254,7 +254,7 @@ class TestWriteToolSecurity:
 # ---------------------------------------------------------------------------
 
 class TestReadToolFallback:
-    @patch("orchestrator.tools.call_claude_as_proxy")
+    @patch("infrastructure.tools.drive.call_claude_as_proxy")
     def test_search_drive_falls_back_to_proxy(self, mock_proxy):
         from orchestrator.tools import _exec_search_google_drive
         mock_proxy.return_value = {"results": [], "total": 0}
@@ -262,14 +262,14 @@ class TestReadToolFallback:
         mock_proxy.assert_called_once()
         assert result["total"] == 0
 
-    @patch("orchestrator.tools.call_claude_as_proxy")
+    @patch("infrastructure.tools.gmail.call_claude_as_proxy")
     def test_search_gmail_falls_back_to_proxy(self, mock_proxy):
         from orchestrator.tools import _exec_search_gmail
         mock_proxy.return_value = {"results": [], "total": 0}
         result = _exec_search_gmail({"query": "test"})
         mock_proxy.assert_called_once()
 
-    @patch("orchestrator.tools.call_claude_as_proxy")
+    @patch("infrastructure.tools.slack.call_claude_as_proxy")
     def test_search_slack_falls_back_to_proxy(self, mock_proxy):
         from orchestrator.tools import _exec_search_slack
         mock_proxy.return_value = {"results": [], "total": 0}
