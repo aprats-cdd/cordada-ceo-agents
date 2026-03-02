@@ -25,10 +25,11 @@ from datetime import datetime
 from pathlib import Path
 
 from domain.registry import AGENTS, get_model_for_agent as get_model
+from domain.model import CostBudget
 from domain.events import EventBus
 
-from .config import OUTPUTS_DIR
-from .agent_runner import run_agent
+from .config import OUTPUTS_DIR, COST_BUDGET_MAX_USD, COST_MAX_OUTPUT_TOKENS, COST_MAX_ITERATIONS
+from .agent_runner import run_agent, last_metrics
 from .canonical import evaluate_output
 from .gates import (
     GateContext,
@@ -69,6 +70,8 @@ def run_pipeline(
     prior_outputs: dict[str, str] | None = None,
     no_context: bool = False,
     evaluate: bool = True,
+    budget: CostBudget | None = None,
+    budget_override: bool = False,
 ) -> dict[str, str]:
     """
     Run a sequence of agents, passing outputs forward.
@@ -88,12 +91,22 @@ def run_pipeline(
                        Merged into the returned dict so callers get the full picture.
         no_context: If True, disable CONTEXT middleware in interactive agents.
         evaluate: If True, run canonical evaluation after each agent (default: True).
+        budget: Cost budget (stop-loss) for the pipeline run. Default: from env vars.
+        budget_override: If True, ignore budget exceeded and continue running.
 
     Returns:
         Dict mapping agent names to their outputs
     """
     interactive_at = interactive_at or set()
     gates = gates or set()
+
+    # Cost governor: build budget from env defaults if not provided
+    if budget is None:
+        budget = CostBudget(
+            max_total_usd=COST_BUDGET_MAX_USD,
+            max_agent_output_tokens=COST_MAX_OUTPUT_TOKENS,
+            max_feedback_iterations=COST_MAX_ITERATIONS,
+        )
 
     # Build the sequence
     all_agents = list(AGENTS.keys())
@@ -142,6 +155,11 @@ def run_pipeline(
     if project_dir:
         print(f"  Project: {project_dir}")
     print(f"  Output dir: {run_dir}")
+    print(f"  Stop-loss: ${budget.max_total_usd:.2f} "
+          f"(warn at {budget.warning_threshold*100:.0f}%, "
+          f"max {budget.max_feedback_iterations} feedback loops)")
+    if budget_override:
+        print(f"  ⚠️ Budget override active — stop-loss disabled")
     print(f"{'#'*60}")
 
     outputs = dict(prior_outputs) if prior_outputs else {}
@@ -175,6 +193,8 @@ def run_pipeline(
             no_context=no_context,
             bus=bus,
             evaluate=evaluate,
+            budget=budget,
+            budget_override=budget_override,
         )
     finally:
         signal.signal(signal.SIGINT, _original_sigint)
@@ -192,12 +212,13 @@ def run_pipeline(
 
     completed_agents = [a for a in sequence if a in outputs]
 
-    # Print epistemic chain and evaluation summary
+    # Print epistemic chain, evaluation, and cost summary
     if bus.events:
         print(f"\n{'─'*60}")
         print(f"  EPISTEMIC CHAIN")
         print(bus.get_chain_summary())
         print(f"\n{bus.get_scores_summary()}")
+        print(f"\n{bus.get_cost_summary()}")
         print(f"{'─'*60}")
 
     if len(completed_agents) == len(sequence):
@@ -233,9 +254,12 @@ def _run_pipeline_loop(
     no_context: bool = False,
     bus: EventBus | None = None,
     evaluate: bool = True,
+    budget: CostBudget | None = None,
+    budget_override: bool = False,
 ) -> None:
     """Inner pipeline loop, extracted so the caller can wrap with signal handling."""
     current_input = initial_input
+    feedback_iteration = 0  # track COLLECT_ITERATE → AUDIT loop count
 
     for i, agent_name in enumerate(sequence):
         # Check for graceful shutdown before starting next agent
@@ -258,6 +282,38 @@ def _run_pipeline_loop(
         step = i + 1
         total = len(sequence)
         model = get_model(agent_name)
+
+        # Cost governor: check budget before each agent
+        if budget and bus and bus.events:
+            cumulative = bus.events[-1].cumulative_cost_usd
+            status = budget.check(cumulative)
+            if status == "exceeded" and not budget_override:
+                # Halt pipeline — stop-loss triggered
+                print(f"\n  {budget.format_status(cumulative)}")
+
+                # Save state
+                state = {
+                    "paused_at": agent_name,
+                    "step": step,
+                    "total_steps": total,
+                    "sequence": sequence,
+                    "topic": topic,
+                    "note": f"Budget exceeded: ${cumulative:.2f} / ${budget.max_total_usd:.2f}",
+                    "timestamp": datetime.now().isoformat(),
+                }
+                state_path = run_dir / "pipeline_state.json"
+                state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+                return
+
+        # Feedback loop cap: track COLLECT_ITERATE → AUDIT iterations
+        if agent_name == "collect_iterate":
+            feedback_iteration += 1
+            if budget and feedback_iteration > budget.max_feedback_iterations:
+                print(f"\n  🛑 Feedback loop cap reached ({budget.max_feedback_iterations} iterations).")
+                print(f"  Pipeline continuing without further feedback loops.")
+                continue  # skip this agent
+
+            print(f"  Feedback iteration {feedback_iteration}/{budget.max_feedback_iterations if budget else '∞'}")
 
         # Build input for this agent — carry forward accumulated context
         if i > 0:
@@ -314,6 +370,13 @@ def _run_pipeline_loop(
 
         # Gate check: pause for human review before running this agent
         if agent_name in gates:
+            # Show budget warning at gate if approaching limit
+            if budget and bus and bus.events:
+                cumulative = bus.events[-1].cumulative_cost_usd
+                status = budget.check(cumulative)
+                if status == "warning":
+                    print(f"\n  {budget.format_status(cumulative)}")
+
             gate_ctx = GateContext(
                 agent_name=agent_name,
                 step=step,
@@ -382,10 +445,14 @@ def _run_pipeline_loop(
             output_path=output_path,
             interactive=is_interactive,
             no_context=no_context,
+            max_output_tokens=budget.max_agent_output_tokens if budget else None,
         )
 
         outputs[agent_name] = response
         current_input = response
+
+        # Retrieve token_usage from the agent run (via last_metrics)
+        agent_token_usage = last_metrics.token_usage if last_metrics else None
 
         # Canonical evaluation + event bus
         if bus:
@@ -404,6 +471,7 @@ def _run_pipeline_loop(
                 output=response,
                 evaluation=eval_result,
                 input_text=pipeline_context,
+                token_usage=agent_token_usage,
             )
 
         # Project mode: commit each agent output
