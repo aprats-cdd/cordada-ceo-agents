@@ -27,6 +27,7 @@ from pathlib import Path
 from domain.registry import AGENTS, get_model_for_agent as get_model
 from domain.model import CostBudget
 from domain.events import EventBus
+from domain.evaluation import evaluate_structural
 
 from .config import OUTPUTS_DIR, COST_BUDGET_MAX_USD, COST_MAX_OUTPUT_TOKENS, COST_MAX_ITERATIONS
 from .agent_runner import run_agent, last_metrics
@@ -493,17 +494,27 @@ def _run_pipeline_loop(
         # Retrieve token_usage from the agent run (via last_metrics)
         agent_token_usage = last_metrics.token_usage if last_metrics else None
 
-        # Canonical evaluation + event bus
+        # Tier 1 structural evaluation (no LLM call) + Tier 2 heuristic
         if bus:
             eval_result = None
+
+            # Tier 1: structural checks (free, deterministic)
+            structural = evaluate_structural(agent_name, structured_output)
+            if structural.checks:
+                print(f"  {structural.summary()}")
+
             if evaluate:
                 canon = AGENTS.get(agent_name)
                 if canon:
-                    print(f"  Evaluating {agent_name.upper()} "
-                          f"[{canon.phase.value}] as {canon.canonical_referent[:50]}...")
-                    eval_result = evaluate_output(agent_name, response)
-                    if eval_result:
-                        print(f"  Score: {eval_result.score}/10 — {eval_result.reasoning}")
+                    if structural.passed:
+                        # Tier 2: heuristic evaluation (Sonnet API call)
+                        print(f"  Evaluating {agent_name.upper()} "
+                              f"[{canon.phase.value}] as {canon.canonical_referent[:50]}...")
+                        eval_result = evaluate_output(agent_name, response)
+                        if eval_result:
+                            print(f"  Score: {eval_result.score}/10 — {eval_result.reasoning}")
+                    else:
+                        print(f"  Tier 1 failed ({structural.score:.0%}) — skipping Tier 2 (saves API call)")
 
             bus.publish(
                 agent_name=agent_name,
