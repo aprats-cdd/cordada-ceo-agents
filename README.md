@@ -34,15 +34,15 @@ The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Da
 │                                                                        │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐         │
 │  │ DISCOVER │───▶│ EXTRACT  │───▶│ VALIDATE │───▶│ COMPILE  │         │
-│  │          │    │          │    │          │    │          │         │
-│  │ Research │    │ Parse    │    │ Verify   │    │ Draft    │         │
-│  │ & rank   │    │ key data │    │ accuracy │    │ document │         │
-│  │ sources  │    │ from     │    │ & check  │    │ (Minto   │         │
-│  │          │    │ sources  │    │ bias     │    │ Pyramid) │         │
+│  │          │    │ ╔══════╗ │    │          │    │          │         │
+│  │ Research │    │ ║fan-out║│    │ Verify   │    │ Draft    │         │
+│  │ & rank   │    │ ║ N≥3  ║│    │ accuracy │    │ document │         │
+│  │ sources  │    │ ║→merge║│    │ & check  │    │ (Minto   │         │
+│  │          │    │ ╚══════╝ │    │ bias     │    │ Pyramid) │         │
 │  └──────────┘    └──────────┘    └──────────┘    └──────────┘         │
 │   web_search      drive_read      web_search      (no tools)          │
 │   drive_search    slack_thread                                        │
-│   slack_search                                                        │
+│   slack_search    (parallel)                                          │
 └──────────────────────────────────┬──────────────────────────────────────┘
                                    │ compiled document
                                    ▼
@@ -136,21 +136,47 @@ The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Da
 
   After each agent:
     1. Validate epistemic invariant (raise or warn on violation)
-    2. Run canonical evaluation (Claude Sonnet as domain expert → score 1-10)
-    3. Publish AgentEvent to bus (persisted to events_{run_id}.json)
+    2. Tier 1: Structural evaluation (free, deterministic)
+    3. Tier 2: Heuristic evaluation (Sonnet call, scored 1-10)
+    4. Publish AgentEvent to bus (persisted to events_{run_id}.json)
+    5. Track cost via TokenUsage → CostBudget (stop-loss)
 
   Pipeline output includes:
-    [OBS] DISCOVER      [7/10]
-    [OBS] EXTRACT       [8/10]
-    [OBS] VALIDATE      [6/10]
-    [MOD] COMPILE       [8/10]
-    [MOD] AUDIT         [7/10]
-    [MOD] REFLECT       [9/10]
-    [DEC] DECIDE        [8/10]
+    [OBS] DISCOVER      [7/10]  $0.02  Structural: 4/4
+    [OBS] EXTRACT       [8/10]  $0.03  (fan-out: 5 sources, 3.2s)
+    [OBS] VALIDATE      [6/10]  $0.02  Structural: 3/3
+    [MOD] COMPILE       [8/10]  $0.05  Structural: 4/4
+    [MOD] AUDIT         [7/10]  $0.08  Structural: 3/3
+    [MOD] REFLECT       [9/10]  $0.06  Structural: 3/3
+    [DEC] DECIDE        [8/10]  $0.04  Structural: 4/4
 
     Chain: OBS → OBS → OBS → MOD → MOD → MOD → DEC
     Epistemic invariant: VALID
-    Average: 7.6/10
+    Cost: $0.30 / $10.00 budget (3%)
+    Señal heurística promedio: 7.6/10 (no calibrada)
+
+═══════════════════════════════════════════════════════════════════════════
+
+  CROSS-CUTTING: COST GOVERNOR + CONTEXT CACHE
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  COST GOVERNOR                         budget ceiling = stop-loss  │
+  │                                                                    │
+  │  TokenUsage (immutable) ──▶ CostBudget.check() ──▶ ok/warn/halt   │
+  │  Opus:  $15/$75 per M tokens                                      │
+  │  Sonnet: $3/$15 per M tokens                                      │
+  │                                                                    │
+  │  Per-agent: max 8000 output tokens                                 │
+  │  Per-run:   max $10 (configurable via env)                         │
+  │  Feedback:  max 3 iterations (caps COLLECT_ITERATE loop)           │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  CONTEXT CACHE                               TTL = 3600s (1 hour)  │
+  │                                                                    │
+  │  SHA-256(question + agent + run_id) ──▶ hit → skip API calls       │
+  │  Invalidated on: gate passage, feedback iteration, CEO override    │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key design properties
@@ -164,8 +190,14 @@ The system is a 3-layer pipeline of 9 sequential agents plus 1 support agent. Da
 | **Feedback loop** | COLLECT_ITERATE feeds back to AUDIT, not DISCOVER. This avoids re-researching; it re-evaluates the same document with new stakeholder input. |
 | **CONTEXT middleware** | CONTEXT intercepts every agent question in interactive mode. It runs a 3-phase pipeline (PLAN → EXECUTE → SYNTHESIZE) using two lightweight Sonnet calls. Scoring is contextual: Claude adopts the canonical domain expert for the calling agent's role (e.g., auditor for VALIDATE, strategy advisor for DECIDE). Only suggestions scoring ≥ 5/10 reach the CEO. |
 | **Epistemic invariant** | `OBSERVATION → MODEL → DECISION`. Every decision is sustained by explicit models, every model by traceable observations. The EventBus validates this at every agent transition. A DECISION never rests on another DECISION or directly on OBSERVATIONS. Structurally enforced by `domain/invariant.py` and validated by the EventBus at every agent transition. |
-| **Canonical evaluation** | After each agent runs, its output is evaluated by Claude adopting the perspective of the canonical domain expert for that agent's role (e.g., auditor for VALIDATE, strategy advisor for DECIDE). Scored 1-10 on criteria specific to each agent. Results persist in the EventBus. |
-| **Event bus** | Every agent execution publishes an `AgentEvent` to a file-backed bus (`events_{run_id}.json`). Events include: epistemic phase, evaluation score, invariant check, input/output summaries. Enables post-mortem analysis and quality tracking across runs. |
+| **3-tier evaluation** | Tier 1: structural checks (free, deterministic — schema validation, field presence, count thresholds). Tier 2: heuristic evaluation (Sonnet call, scored 1-10 by canonical domain expert). Tier 3: calibration bank (CEO scores vs Claude — Pearson correlation + drift tracking). Tier 1 gates Tier 2: if structural fails, skip the API call. |
+| **Cost governance** | `TokenUsage` (immutable) tracks per-call cost. `CostBudget` enforces a ceiling (default $10) as a stop-loss. Pipeline halts on budget exceeded, warns at 80% threshold. Feedback iterations capped at 3. Per-agent output tokens capped at 8000. |
+| **Inter-agent contracts** | Each agent has a typed output schema (`domain/contracts.py`): `DiscoverOutput`, `ExtractOutput`, etc. with `validate()`, `to_json()`, `from_json()`. Contract parser extracts JSON from mixed markdown/JSON responses, retries once on parse failure. |
+| **Parallel EXTRACT** | When DISCOVER produces 3+ sources, EXTRACT runs in parallel via `asyncio.gather()` with semaphore (max 5 concurrent). Results are merged deterministically: claims deduplicated (case-insensitive), sorted by confidence. `--sequential` CLI flag for debugging. |
+| **Feedback diff** | Between feedback loop iterations (COLLECT_ITERATE → AUDIT), a semantic diff identifies new observations, changed assessments, and unchanged items. Prevents the CEO from re-reading 50 pages when only 2 paragraphs changed. |
+| **Context cache** | TTL-based in-memory cache (1 hour) for CONTEXT middleware. Same question within a run skips PLAN + EXECUTE + SYNTHESIZE. Invalidated on gate passage, feedback iteration, or CEO override. |
+| **Structured observability** | `AgentSpan` records per-agent metrics. `PipelineObserver` produces a CEO-friendly summary (the pipeline's P&L statement). JSONL export for downstream analysis. `compute_stats()` for cross-run trends. |
+| **Event bus** | Every agent execution publishes an `AgentEvent` to a file-backed bus (`events_{run_id}.json`). Events include: epistemic phase, evaluation score, invariant check, input/output summaries, token usage, structured output. Enables post-mortem analysis and quality tracking across runs. |
 | **Token budget** | Context accumulation is dynamically sized to fit within model limits. Prior outputs are proportionally truncated — the most recent agent's output is always passed in full. |
 | **Graceful shutdown** | Ctrl+C during a pipeline run saves state to manifest and commits to GitHub. The pipeline can be resumed exactly where it stopped. |
 
@@ -417,7 +449,12 @@ cordada-ceo-agents/
 ├── domain/                        ← BOUNDED CONTEXT: Core domain (zero external deps)
 │   ├── __init__.py                   Exports: AgentDefinition, EpistemicPhase, EventBus
 │   ├── model.py                     Value objects: AgentDefinition, EpistemicPhase,
-│   │                                  AgentEvaluation
+│   │                                  AgentEvaluation, TokenUsage, CostBudget
+│   ├── contracts.py                 Inter-agent output schemas: DiscoverOutput,
+│   │                                  ExtractOutput, ValidateOutput, etc.
+│   ├── evaluation.py                Tier 1 structural evaluation: per-agent checkers
+│   ├── calibration.py               Calibration bank: CEO vs Claude score tracking
+│   ├── feedback.py                  FeedbackDiff: semantic diff between iterations
 │   ├── registry.py                  Single source of truth: AGENTS dict
 │   │                                  (unified config + canon + evaluation criteria)
 │   ├── events.py                    Domain events: AgentEvent, EventBus,
@@ -425,6 +462,7 @@ cordada-ceo-agents/
 │   └── invariant.py                 Epistemic chain validation (pure logic, no I/O)
 │
 ├── infrastructure/                ← INFRASTRUCTURE layer: external service adapters
+│   ├── observability.py             Structured spans, pipeline summaries, JSONL export
 │   └── tools/                       Tool executors split by bounded context:
 │       ├── __init__.py               Facade: assembles all modules, public API
 │       ├── _shared.py                Shared infra: timeout, auth detection, factories
@@ -441,7 +479,12 @@ cordada-ceo-agents/
 │   ├── __init__.py                   Public Python API + re-exports from domain/
 │   ├── __main__.py                   CLI entry point
 │   ├── config.py                     Env vars, paths (re-exports AGENTS from domain)
-│   ├── canonical.py                  Evaluation service: Claude API calls
+│   ├── heuristic_eval.py             Tier 2 heuristic evaluation (Sonnet API call)
+│   ├── canonical.py                  Backward-compat shim → heuristic_eval.py
+│   ├── contract_parser.py            JSON extraction, schema injection, retry prompts
+│   ├── parallel.py                   Fan-out/fan-in for EXTRACT (asyncio + semaphore)
+│   ├── context_cache.py              TTL cache for CONTEXT middleware results
+│   ├── feedback_diff.py              Semantic diff between feedback iterations
 │   ├── event_bus.py                  Re-export from domain.events
 │   ├── agent_runner.py               Agent execution: API calls, tool loop, metrics
 │   ├── pipeline.py                   Pipeline orchestration: sequence, gates, events
@@ -450,7 +493,7 @@ cordada-ceo-agents/
 │   ├── context_middleware.py         3-phase CONTEXT: PLAN → EXECUTE → SYNTHESIZE
 │   └── project.py                    GitHub project management
 │
-├── tests/                         ← Unit tests (28 tool tests, config, pipeline, etc.)
+├── tests/                         ← Unit tests (258 tests: contracts, evaluation, cost, etc.)
 ├── docs/                          ← architecture.html (Material 3 interactive diagram)
 ├── examples/                      ← carta_aportantes.py
 ├── outputs/                       ← Pipeline outputs (gitignored)
@@ -506,15 +549,21 @@ agent["file"]            # "04_compile.md" (legacy dict access, backward compat)
 | Pattern | Where | Reference |
 |---------|-------|-----------|
 | Sequential Workflow | Full Layer 1 pipeline | Gullí (2025) Ch. 6 |
+| Fan-out/Fan-in | EXTRACT parallel when 3+ sources | Gullí (2025) Ch. 7 |
 | Tool Use | DISCOVER, VALIDATE, EXTRACT, DISTRIBUTE | Gullí (2025) Ch. 5 |
 | RAG | EXTRACT, COMPILE | Gullí (2025) Ch. 11 |
 | Multi-Agent Debate | AUDIT | Gullí (2025) Ch. 8 |
 | Reflection | REFLECT | Gullí (2025) Ch. 4 |
 | Human-in-the-Loop | Gates at AUDIT → COLLECT_ITERATE | Gullí (2025) Ch. 13 |
-| Guardrails | VALIDATE | Gullí (2025) Ch. 12 |
-| Canonical Evaluation | Every agent scored 1-10 by domain expert | — |
+| Guardrails | VALIDATE, Structural Eval, Cost Governor | Gullí (2025) Ch. 12 |
+| Contract-First Design | `domain/contracts.py` per-agent output schemas | — |
+| 3-Tier Evaluation | Structural → Heuristic → Calibration | — |
+| Cost Governor (Stop-Loss) | TokenUsage + CostBudget per pipeline run | — |
 | Epistemic Invariant | OBS→MOD→DEC enforced by EventBus | — |
 | Event Sourcing | File-backed audit trail per pipeline run | — |
+| Caching | Context cache with TTL + run-scoped invalidation | — |
+| State Diffing | Feedback loop redlining (FeedbackDiff) | — |
+| Structured Observability | AgentSpan + PipelineObserver + JSONL export | — |
 | Graceful Degradation | Tool fallback via Claude proxy | — |
 
 ## References

@@ -23,12 +23,17 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, asdict
 from typing import Any
 
 from domain.registry import AGENTS
+from .context_cache import ContextCache
 
 logger = logging.getLogger(__name__)
+
+# Module-level cache instance (shared across all middleware calls in a session)
+_cache = ContextCache(ttl_seconds=3600)
 
 # Model used for CONTEXT calls (lightweight, fast)
 _CONTEXT_MODEL = "claude-sonnet-4-20250514"
@@ -347,43 +352,116 @@ def _synthesize(
 def suggest_answers(
     assistant_text: str,
     agent_name: str = "discover",
+    run_id: str = "",
 ) -> ContextResult | None:
     """Run the full CONTEXT pipeline: PLAN -> EXECUTE -> SYNTHESIZE.
+
+    Uses the TTL cache to avoid repeated API calls for the same question
+    within the same pipeline run.
 
     Args:
         assistant_text: Raw text output from the agent.
         agent_name: Which agent is asking (affects search strategy and scoring).
+        run_id: Pipeline run ID for cache scoping.
 
     Returns:
         ContextResult with scored suggestions, or None if no questions found.
     """
+    start_time = time.time()
+
+    # Check cache before doing any API calls
+    cached = _cache.get(assistant_text, agent_name, run_id)
+    if cached is not None:
+        elapsed = time.time() - start_time
+        logger.info("CONTEXT cache hit for %s (%.1fms)", agent_name, elapsed * 1000)
+        result = _deserialize_result(cached)
+        result._cached = True
+        result._elapsed = elapsed
+        result._api_calls = 0
+        return result
+
     agent_def = AGENTS.get(agent_name)
     agent_description = agent_def.description if agent_def else "Agent"
 
+    api_calls = 0
+
     # Phase 1: PLAN
     planned = _plan_searches(agent_name, agent_description, assistant_text)
+    api_calls += 1
     if not planned:
         return None
 
     # Phase 2: EXECUTE
     raw_results = _execute_searches(planned)
+    api_calls += sum(len(pq.get("searches", [])) for pq in planned)
 
     # Phase 3: SYNTHESIZE
     result = _synthesize(agent_name, agent_description, raw_results)
+    api_calls += 1
 
     if not result.suggestions and not result.unanswered:
         return None
 
+    elapsed = time.time() - start_time
+
+    # Store in cache
+    _cache.put(assistant_text, agent_name, run_id, _serialize_result(result))
+
+    result._cached = False
+    result._elapsed = elapsed
+    result._api_calls = api_calls
     return result
+
+
+def invalidate_context_cache(run_id: str = "") -> int:
+    """Invalidate context cache for a run (called on gate/feedback/override).
+
+    Returns the number of entries invalidated.
+    """
+    if run_id:
+        return _cache.invalidate_run(run_id)
+    _cache.clear()
+    return 0
+
+
+def get_context_cache() -> ContextCache:
+    """Access the module-level cache instance (for testing/inspection)."""
+    return _cache
+
+
+def _serialize_result(result: ContextResult) -> dict:
+    """Serialize a ContextResult to a dict for caching."""
+    return {
+        "suggestions": [asdict(s) for s in result.suggestions],
+        "unanswered": result.unanswered,
+    }
+
+
+def _deserialize_result(data: dict) -> ContextResult:
+    """Deserialize a cached dict back to ContextResult."""
+    suggestions = [Suggestion(**s) for s in data.get("suggestions", [])]
+    return ContextResult(
+        suggestions=suggestions,
+        unanswered=data.get("unanswered", []),
+    )
 
 
 def format_suggestions(result: ContextResult) -> str:
     """Format a ContextResult for the CEO."""
     lines: list[str] = []
-    lines.append("\n  CONTEXT encontro respuestas sugeridas:\n")
+
+    cached = getattr(result, "_cached", False)
+    elapsed = getattr(result, "_elapsed", 0.0)
+    api_calls = getattr(result, "_api_calls", 0)
+
+    if cached:
+        lines.append("\n  CONTEXT encontro respuestas sugeridas (cached):\n")
+    else:
+        lines.append("\n  CONTEXT encontro respuestas sugeridas:\n")
 
     for s in result.suggestions:
-        lines.append(f"  **{s.question}** [{s.score}/10]")
+        timing = f"(cached, {elapsed:.1f}s)" if cached else f"({api_calls} API calls, {elapsed:.1f}s)"
+        lines.append(f"  **{s.question}** [{s.score}/10] {timing}")
         lines.append(f"  -> Sugerencia: {s.answer}")
         lines.append(f"     Fuente: {s.source_type} - {s.source_name}")
         lines.append(f"     Fecha: {s.date}")

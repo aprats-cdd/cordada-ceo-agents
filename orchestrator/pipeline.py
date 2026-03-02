@@ -25,14 +25,15 @@ from datetime import datetime
 from pathlib import Path
 
 from domain.registry import AGENTS, get_model_for_agent as get_model
-from domain.model import CostBudget
+from domain.model import CostBudget, TokenUsage
 from domain.events import EventBus
 from domain.evaluation import evaluate_structural
 
 from .config import OUTPUTS_DIR, COST_BUDGET_MAX_USD, COST_MAX_OUTPUT_TOKENS, COST_MAX_ITERATIONS
 from .agent_runner import run_agent, last_metrics
-from .canonical import evaluate_output
+from .heuristic_eval import evaluate_output
 from .contract_parser import try_parse, get_schema_instruction, get_retry_prompt
+from .parallel import fan_out_extract, merge_extractions, FAN_OUT_THRESHOLD
 from .gates import (
     GateContext,
     GateResult,
@@ -74,6 +75,7 @@ def run_pipeline(
     evaluate: bool = True,
     budget: CostBudget | None = None,
     budget_override: bool = False,
+    sequential: bool = False,
 ) -> dict[str, str]:
     """
     Run a sequence of agents, passing outputs forward.
@@ -95,6 +97,7 @@ def run_pipeline(
         evaluate: If True, run canonical evaluation after each agent (default: True).
         budget: Cost budget (stop-loss) for the pipeline run. Default: from env vars.
         budget_override: If True, ignore budget exceeded and continue running.
+        sequential: If True, force sequential EXTRACT even with many sources.
 
     Returns:
         Dict mapping agent names to their outputs
@@ -197,6 +200,7 @@ def run_pipeline(
             evaluate=evaluate,
             budget=budget,
             budget_override=budget_override,
+            sequential=sequential,
         )
     finally:
         signal.signal(signal.SIGINT, _original_sigint)
@@ -258,10 +262,12 @@ def _run_pipeline_loop(
     evaluate: bool = True,
     budget: CostBudget | None = None,
     budget_override: bool = False,
+    sequential: bool = False,
 ) -> None:
     """Inner pipeline loop, extracted so the caller can wrap with signal handling."""
     current_input = initial_input
     feedback_iteration = 0  # track COLLECT_ITERATE → AUDIT loop count
+    structured_outputs: dict[str, dict] = {}  # agent_name → structured output dict
 
     for i, agent_name in enumerate(sequence):
         # Check for graceful shutdown before starting next agent
@@ -447,52 +453,120 @@ def _run_pipeline_loop(
             agent_input = pipeline_context + schema_instruction
         output_path = run_dir / f"{step:02d}_{agent_name}.md"
 
-        response = run_agent(
-            agent_name=agent_name,
-            user_input=agent_input,
-            output_path=output_path,
-            interactive=is_interactive,
-            no_context=no_context,
-            max_output_tokens=budget.max_agent_output_tokens if budget else None,
-        )
+        # Fan-out check: parallel EXTRACT when DISCOVER produced many sources
+        fan_out_used = False
+        if (
+            agent_name == "extract"
+            and not sequential
+            and not is_interactive
+            and "discover" in structured_outputs
+        ):
+            import asyncio
+            from domain.contracts import SourceCard
+
+            discover_data = structured_outputs["discover"]
+            sources_raw = discover_data.get("sources", [])
+            if len(sources_raw) >= FAN_OUT_THRESHOLD:
+                sources = [SourceCard(**s) for s in sources_raw]
+                cumulative = bus.events[-1].cumulative_cost_usd if bus and bus.events else 0.0
+
+                merged_output, merged_text, token_usages = asyncio.run(
+                    fan_out_extract(
+                        sources=sources,
+                        run_agent_fn=run_agent,
+                        max_concurrent=5,
+                        cost_budget=budget,
+                        cumulative_cost=cumulative,
+                        pipeline_context=pipeline_context,
+                        schema_instruction=schema_instruction or "",
+                        output_dir=run_dir,
+                        max_output_tokens=budget.max_agent_output_tokens if budget else None,
+                    )
+                )
+
+                response = merged_text
+                fan_out_used = True
+
+                # Save merged output
+                output_path.write_text(response, encoding="utf-8")
+
+                # Aggregate token usages for the fan-out step
+                if token_usages:
+                    total_input = sum(t.input_tokens for t in token_usages)
+                    total_output = sum(t.output_tokens for t in token_usages)
+                    total_cost = sum(t.cost_usd for t in token_usages)
+                    agent_token_usage_override = TokenUsage(
+                        input_tokens=total_input,
+                        output_tokens=total_output,
+                        model=token_usages[0].model,
+                        cost_usd=total_cost,
+                    )
+                else:
+                    agent_token_usage_override = None
+
+        if not fan_out_used:
+            response = run_agent(
+                agent_name=agent_name,
+                user_input=agent_input,
+                output_path=output_path,
+                interactive=is_interactive,
+                no_context=no_context,
+                max_output_tokens=budget.max_agent_output_tokens if budget else None,
+            )
+            agent_token_usage_override = None
 
         # Contract parsing: try to parse output to structured schema
         structured_output = None
-        parse_result = try_parse(agent_name, response)
 
-        if not parse_result.success and parse_result.errors:
-            # Retry once with error feedback
-            print(f"  Contract parse failed for {agent_name.upper()}: {parse_result.errors}")
-            print(f"  Retrying with schema correction prompt...")
-
-            retry_prompt = get_retry_prompt(agent_name, parse_result.errors)
-            retry_input = f"{response}\n\n---\n\n{retry_prompt}"
-
-            response = run_agent(
-                agent_name=agent_name,
-                user_input=retry_input,
-                output_path=output_path,
-                interactive=False,
-                save=False,
-                verbose=False,
-                max_output_tokens=budget.max_agent_output_tokens if budget else None,
-            )
-
+        if fan_out_used:
+            # Fan-out already produced a merged ExtractOutput
+            from dataclasses import asdict as _asdict
+            structured_output = _asdict(merged_output)
+            parse_result = try_parse(agent_name, response)  # for logging
+        else:
             parse_result = try_parse(agent_name, response)
-            if parse_result.success:
-                print(f"  Contract retry succeeded for {agent_name.upper()}")
-            else:
-                print(f"  Contract retry failed for {agent_name.upper()}: {parse_result.errors}")
-                print(f"  Continuing with raw output.")
 
-        if parse_result.success and parse_result.structured:
-            structured_output = parse_result.structured
+            if not parse_result.success and parse_result.errors:
+                # Retry once with error feedback
+                print(f"  Contract parse failed for {agent_name.upper()}: {parse_result.errors}")
+                print(f"  Retrying with schema correction prompt...")
+
+                retry_prompt = get_retry_prompt(agent_name, parse_result.errors)
+                retry_input = f"{response}\n\n---\n\n{retry_prompt}"
+
+                response = run_agent(
+                    agent_name=agent_name,
+                    user_input=retry_input,
+                    output_path=output_path,
+                    interactive=False,
+                    save=False,
+                    verbose=False,
+                    max_output_tokens=budget.max_agent_output_tokens if budget else None,
+                )
+
+                parse_result = try_parse(agent_name, response)
+                if parse_result.success:
+                    print(f"  Contract retry succeeded for {agent_name.upper()}")
+                else:
+                    print(f"  Contract retry failed for {agent_name.upper()}: {parse_result.errors}")
+                    print(f"  Continuing with raw output.")
+
+            if parse_result.success and parse_result.structured:
+                structured_output = parse_result.structured
 
         outputs[agent_name] = response
         current_input = response
 
+        # Track structured outputs for downstream fan-out decisions
+        if structured_output:
+            structured_outputs[agent_name] = structured_output
+
         # Retrieve token_usage from the agent run (via last_metrics)
-        agent_token_usage = last_metrics.token_usage if last_metrics else None
+        # Fan-out provides its own aggregated token usage
+        if agent_token_usage_override:
+            agent_token_usage = agent_token_usage_override
+        else:
+            agent_token_usage = last_metrics.token_usage if last_metrics else None
 
         # Tier 1 structural evaluation (no LLM call) + Tier 2 heuristic
         if bus:
@@ -512,7 +586,7 @@ def _run_pipeline_loop(
                               f"[{canon.phase.value}] as {canon.canonical_referent[:50]}...")
                         eval_result = evaluate_output(agent_name, response)
                         if eval_result:
-                            print(f"  Score: {eval_result.score}/10 — {eval_result.reasoning}")
+                            print(f"  Señal heurística: {eval_result.score}/10 (no calibrada) — {eval_result.reasoning}")
                     else:
                         print(f"  Tier 1 failed ({structural.score:.0%}) — skipping Tier 2 (saves API call)")
 
@@ -688,6 +762,11 @@ Examples:
         action="store_true",
         help="Disable CONTEXT middleware (skip Drive/Gmail/Slack suggestions in interactive mode)",
     )
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Force sequential EXTRACT execution (disable fan-out parallelism)",
+    )
 
     args = parser.parse_args()
 
@@ -720,6 +799,7 @@ Examples:
         project_description=args.project_description,
         gates=gate_set,
         no_context=args.no_context,
+        sequential=args.sequential,
     )
 
 
